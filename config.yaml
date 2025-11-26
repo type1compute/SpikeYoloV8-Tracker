@@ -1,0 +1,395 @@
+# Traffic_Monitoring SpikeYOLO Configuration File
+# Streamlined version with only actively used configurations
+
+# =============================================================================
+# DATA PATHS
+# =============================================================================
+data:
+  # Root directory containing HDF5 files
+  data_root: "/home/ubuntu/eTraM/eTraM/static/data"
+  
+  # Directory containing annotation files
+  annotation_dir: "/home/ubuntu/Traffic_Monitoring/class annotations"
+  
+  # Training data subdirectories
+  train_folders:
+    - "train_h5_1"
+    - "train_h5_2" 
+    - "train_h5_3"
+    - "train_h5_4"
+    - "train_h5_5"
+    - "train_h5_6"
+  
+  # Validation data subdirectories
+  val_folders:
+    - "val_h5_1"
+    - "val_h5_2"
+  
+  # Test data subdirectories
+  test_folders:
+    - "test_h5_1"
+    - "test_h5_2"
+
+# =============================================================================
+# MODEL PATHS
+# =============================================================================
+model:
+  # Directory to save model checkpoints
+  checkpoint_dir: "/home/ubuntu/eTraM/eTraM/static/checkpoints/New_Run_1"
+  
+  # Path to trained model checkpoint
+  checkpoint_path: "final_comprehensive_model.pth"
+  
+  # Path to best model checkpoint
+  best_model_path: "best_model.pth"
+  
+  # Directory to save evaluation results
+  results_dir: "/home/ubuntu/eTraM/eTraM/static/checkpoints/New_Run_1"
+  
+  # Directory to save logs
+  logs_dir: "/home/ubuntu/eTraM/eTraM/static/checkpoints/New_Run_1"
+  
+  # Log file name (if empty, uses timestamp-based naming)
+  log_file_name: "training.log"
+
+  # Tracking feature dimension
+  track_feature_dim: 128
+
+# =============================================================================
+# MODEL ARCHITECTURE
+# =============================================================================
+architecture:
+  # Number of object classes
+  num_classes: 3
+
+  # Time window in microseconds
+  time_window_us: 100000  # 100ms
+
+  # Number of time steps for temporal processing
+  time_steps: 8
+  
+  # Tracking feature dimension
+  track_feature_dim: 128
+  
+  # Model name
+  model_name: "Traffic_Monitoring_SpikeYOLO_With_Tracking"
+
+# =============================================================================
+# TRAINING PARAMETERS
+# =============================================================================
+training:
+  # Number of training epochs (updated from hyperparameter search)
+  epochs: 500
+  
+  # Batch size (reduced to 20 to avoid CUDA OOM errors)
+  batch_size: 20
+  
+  # Mixed Precision Training (Automatic Mixed Precision for faster training on H100)
+  # DISABLED: SpikeYOLO operations are incompatible with FP16 (causes NaN even after FP32 training)
+  # Focus on other optimizations: batch size, data loading, gradient accumulation
+  use_amp: true
+  
+  # Quantization-Aware Training (QAT) - DISABLED (slows training, only helps inference)
+  use_quantization: false  # Disabled: QAT slows training by 5-15%
+  
+  # Direct FP16 Training - DISABLED (causes NaN with SpikeYOLO)
+  # NOTE: Both AMP and direct FP16 (model.half()) cause NaN with SpikeYOLO operations
+  # SpikeYOLO operations are incompatible with FP16 precision
+  use_fp16: false  # Disabled: Causes NaN with SpikeYOLO
+  
+  # Learning rate (from best hyperparameters, works with proper initialization)
+  learning_rate: 0.001  # Balanced LR with proper weight init
+  
+  # Minimum learning rate (prevents decay to zero)
+  # Set to 5% of base LR
+  min_learning_rate: 0.00005  # 5% of base LR (0.001 * 0.05)
+  
+  # Warmup epochs for gradual learning rate increase
+  warmup_epochs: 3
+  
+  # Optimizer (from best hyperparameters: Trial 6 - AdamW)
+  optimizer: "adamw"
+  
+  # Momentum for SGD (only used when optimizer is 'sgd')
+  momentum: 0.9
+  
+  # Learning rate scheduler (from best hyperparameters: Trial 6 - cosine)
+  lr_scheduler: "cosine"
+  
+  # Maximum learning rate for cyclic scheduler (only used when lr_scheduler is 'cyclic')
+  max_learning_rate: 0.002
+  
+  # Learning rate decay steps (for step scheduler only - ignored for cosine scheduler)
+  lr_decay_steps: 2
+  
+  # Learning rate decay factor (for step scheduler only - ignored for cosine scheduler)
+  lr_decay: 0.5
+  
+  # Weight decay (from best hyperparameters: Trial 6)
+  weight_decay: 0.00001509  # 1.509e-05
+  
+  # Gradient accumulation steps (accumulate gradients over N batches before optimizer step)
+  # This simulates a larger batch size: effective_batch_size = batch_size * gradient_accumulation_steps
+  # With batch_size=50 and accumulation=1: 50 * 1 = 50 effective batch size
+  gradient_accumulation_steps: 1
+  
+  # Checkpoint frequency (save checkpoint every N epochs)
+  checkpoint_frequency: 1
+  
+  # Validation frequency (validate every N epochs)
+  validation_frequency: 1
+  
+  # Early stopping patience
+  early_stopping_patience: 5
+
+# =============================================================================
+# MODEL PRUNING
+# =============================================================================
+pruning:
+  # Enable/disable pruning
+  enabled: false
+  
+  # Pruning type: 'unstructured' (individual weights) or 'structured' (channels/filters)
+  type: "unstructured"
+  
+  # Initial pruning amount (0.0 to 1.0)
+  amount: 0.1
+  
+  # Maximum sparsity for iterative pruning (0.0 to 1.0)
+  max_sparsity: 0.5
+  
+  # Pruning schedule: 'linear', 'cosine', or 'step'
+  schedule: "linear"
+  
+  # Frequency of pruning application (every N epochs)
+  frequency: 1
+
+# =============================================================================
+# YOLO LOSS CONFIGURATION
+# =============================================================================
+yolo_loss:
+  # Box regression loss weight - TARGET: 50-60% of total loss
+  # Box loss (1-IoU) typically ranges 0.3-0.6 early, 0.1-0.3 later
+  # Loss component weights (corrected for proper DFL decoding)
+  # Previous weights were from hyperparameter search with broken DFL code
+  # These are standard YOLO-based weights adjusted for proper DFL implementation
+  box_loss_weight: 7.5         # Bounding box regression loss (standard YOLO value)
+  cls_loss_weight: 10.0        # Classification loss (higher to compensate for small magnitude)
+  track_loss_weight: 1.0       # Tracking feature loss (learns discriminative embeddings for re-identification)
+  
+  # Multi-scale loss weights for Feature Pyramid Network (P5, P4, P3)
+  # P5 (coarse, 23x40): Best for large objects (vehicles far away)
+  # P4 (medium): Best for medium objects (nearby vehicles, large pedestrians)
+  # P3 (fine): Best for small objects (pedestrians, micro-mobility)
+  # Weights should sum to 1.0. Favoring P3 helps with small object detection (pedestrians)
+  #scale_weights: [0.30, 0.35, 0.35]  # [P5, P4, P3] - Balanced with emphasis on P4/P3 for better pedestrian detection
+  
+  # IoU threshold for matching predictions to targets
+  iou_threshold: 0.4  # Final target IoU threshold (balanced matches)
+  
+  # Box loss type: 'iou', 'giou', 'diou', 'ciou'
+  # - IoU: Basic IoU loss (1 - IoU) - no gradients when boxes don't overlap
+  # - GIoU: Generalized IoU - provides gradients even when boxes don't overlap
+  # - DIoU: Distance IoU - considers center distance and box size
+  # - CIoU: Complete IoU - considers IoU, center distance, and aspect ratio (best performance)
+  box_loss_type: ciou  # Use CIoU for better localization, especially for non-overlapping boxes
+  
+  # Adaptive IoU threshold: start lower and increase as training progresses
+  # This helps early training by allowing easier matches, then gets stricter
+  use_adaptive_iou: true
+  adaptive_iou_start: 0.15  # Low threshold at start to allow matches in early training
+  adaptive_iou_epochs: 20   # Gradually increase from 0.15 to 0.7 over first 20 epochs
+  
+  # Use Focal Loss for classification (helps with hard examples)
+  use_focal_loss: true
+  
+  # Focal Loss alpha parameter (weighting factor)
+  focal_alpha: 0.25
+  
+  # Focal Loss gamma parameter (focusing parameter, higher = more focus on hard examples)
+  focal_gamma: 2.0
+  
+  # Label smoothing for regularization (prevents overconfidence)
+  label_smoothing: 0.1
+  
+  # Class weights for handling imbalanced data
+  # Manual class weights: [Pedestrian, Vehicle, Micromobility]
+  # Micromobility (class 2) is rarest, so give it 3x higher weight
+  class_weights: [1.0, 1.0, 3.0]
+  # When enabled, automatically calculates class weights from training data
+  # to give more weight to rare classes and less weight to common classes
+  use_class_weights: false  # Disabled - using manual weights above
+  class_weight_calculation_samples: 5000  # Number of samples to use for weight calculation
+
+# =============================================================================
+# DATA PROCESSING
+# =============================================================================
+data_processing:
+  # Image dimensions for coordinate normalization (default: event camera resolution)
+  image_width: 1280.0
+  image_height: 720.0
+
+  # Use fine-grained temporal processing
+  use_fine_grained: true
+  
+  # Data loading optimizations
+  prefetch_factor: 4  # Prefetch 4 batches ahead (balanced for 6 workers)
+  persistent_workers: true  # Keep workers alive between epochs for better performance
+  pin_memory: true  # Faster GPU transfer with dedicated GPU
+  
+  # Sample configuration
+  max_events_per_sample: 10000000  # Events per sample
+  max_samples_per_file: 100     # Maximum samples per HDF5 file (can lead to class imbalance when used alone)
+  
+  # DataLoader workers (increased for better I/O parallelization with ~60 batches)
+  num_workers: 12  # Increased for better HDF5 I/O parallelization and GPU utilization
+  
+  # Sample caching to speed up repeated accesses (stores preprocessed samples in memory)
+  cache_samples: false  # DISABLED: Caching on GPU causes OOM with large datasets
+  preload_all_samples: false  # PRE-LOAD ALL SAMPLES INTO RAM during init (DISABLED: causes CUDA OOM)
+  debug_sample_loading: false  # Set true to log per-sample streaming info (adds overhead)
+  
+  # Class balancing configuration (when use_class_balanced_sampling=true)
+  # Annotation-based limiting: Directly control class balance by limiting annotations per class
+  max_annotations_per_class: 200  # Balanced amount for efficient training with good diversity
+                                   # When set with use_class_balanced_sampling=true, directly controls class balance
+                                   # null = balance to rarest class's count
+  
+  # Validation class balancing configuration
+  # Validation uses the same annotation-based approach as training
+  max_annotations_per_class_validation: null  # Maximum annotations per class for validation (null = use ratio of training)
+  validation_annotation_ratio: 0.2            # Percentage of training max_annotations_per_class to use for validation (0.0-1.0)
+  validation_min_annotations_per_class: 100   # Minimum annotations per class for validation
+  
+  # Targeted training: Only sample time windows that contain annotations
+  targeted_training: true  # When enabled, only use samples with ground truth annotations
+  
+  # Class-balanced sampling: Ensure balanced representation across classes AND file diversity
+  use_class_balanced_sampling: true  # When enabled, samples are selected to balance classes AND spread across files
+  min_samples_per_class: 1  # Minimum samples per class to ensure all classes are represented
+  
+  # File diversity: When class-balanced sampling is enabled, ensures samples are spread across different files
+  # This ensures good representation of different conditions (night/day, weather, location, etc.)
+  # The selection prioritizes: 70% class balance, 30% file diversity
+  # This means the model learns from diverse conditions while maintaining class balance
+  
+  # Annotation type: Use 3-class annotations (in same folder as h5 files) or 8-class annotations (in annotation_dir)
+  use_3_class_annotations: true  # Set to true to use 3-class annotations from h5 file folder, false for 8-class from annotation_dir
+
+# =============================================================================
+# EVALUATION PARAMETERS
+# =============================================================================
+evaluation:
+  # IoU threshold for positive/negative classification
+  iou_threshold: 0.4
+  
+  # Confidence threshold for detections
+  confidence_threshold: 0.2  # Lowered to 0.2 to capture more predictions (especially for rare classes)
+  
+  # Number of samples for evaluation
+  eval_samples: 10
+  
+  # Ratio of training max_annotations_per_class to use for evaluation
+  # Evaluation will use: training_max_annotations_per_class * evaluation_annotation_ratio
+  evaluation_annotation_ratio: 0.2  # 20% of training max_annotations_per_class
+  
+  # Save evaluation results
+  save_results: true
+
+# =============================================================================
+# LOGGING AND MONITORING
+# =============================================================================
+logging:
+  # Log level (DEBUG, INFO, WARNING, ERROR)
+  level: "INFO"
+  
+  # Log format
+  format: "%(asctime)s - %(levelname)s - %(message)s"
+  
+  # Save logs to file
+  save_to_file: true
+  
+  # Log file name
+  log_file: "traffic_monitoring_spikeyolo.log"
+  
+  # Print training progress
+  print_progress: true
+  
+  # Print every N batches (reduced for better performance)
+  print_every: 10
+
+# =============================================================================
+# DEVICE CONFIGURATION
+# =============================================================================
+device:
+  # Force CPU usage (set to true to disable GPU)
+  force_cpu: false
+
+# =============================================================================
+# CLASS NAMES
+# =============================================================================
+# 8-class names (for fine-grained annotations)
+classes_8:
+  - "Pedestrian"
+  - "Car"
+  - "Bicycle"
+  - "Bus"
+  - "Motorbike"
+  - "Truck"
+  - "Tram"
+  - "Wheelchair"
+
+# 3-class names (for coarse-grained annotations)
+# Mapping: class_id 0 = Pedestrian, class_id 1 = Vehicle, class_id 2 = Micro-mobility
+classes_3:
+  - "Pedestrian"
+  - "Vehicle"
+  - "Micro-mobility"
+
+# Class names (automatically selected based on use_3_class_annotations)
+# This is a compatibility field - use get_class_names() method instead
+classes:
+  - "Pedestrian"
+  - "Car"
+  - "Bicycle"
+  - "Bus"
+  - "Motorbike"
+  - "Truck"
+  - "Tram"
+  - "Wheelchair"
+
+# =============================================================================
+# PATHS FOR DIFFERENT ENVIRONMENTS
+# =============================================================================
+# Flat config mapping to avoid env specific path key/value duplication in other configs
+environments:
+  # Local development environment
+  local:
+    data_root: "/Volumes/Extended/DevDependency/Type1Compute/MVP-Demo/Traffic_Monitoring/data"
+    annotation_dir: "/Volumes/Extended/DevDependency/Type1Compute/MVP-Demo/Traffic_Monitoring/data/class annotations"
+    checkpoint_dir: "./checkpoints"
+    results_dir: "./results"
+    logs_dir: "./logs"
+  
+  # VM/Server environment
+  vm:
+    data_root: "/home/ubuntu/eTraM/eTraM/static/data"
+    annotation_dir: "/home/ubuntu/Traffic_Monitoring/class annotations"
+    checkpoint_dir: "/home/ubuntu/eTraM/eTraM/static/checkpoints/New_Run_1"
+    checkpoint_file: ""
+    results_dir: "/home/ubuntu/eTraM/eTraM/static/checkpoints/New_Run_1"
+    logs_dir: "/home/ubuntu/eTraM/eTraM/static/checkpoints/New_Run_1"
+  
+  # Docker environment
+  docker:
+    data_root: "/app/data"
+    annotation_dir: "/app/data/class annotations"
+    checkpoint_dir: "/app/checkpoints"
+    results_dir: "/app/results"
+    logs_dir: "/app/logs"
+
+# =============================================================================
+# CURRENT ENVIRONMENT
+# =============================================================================
+# Set this to 'local', 'vm', or 'docker' to use the corresponding paths
+current_environment: "vm"
