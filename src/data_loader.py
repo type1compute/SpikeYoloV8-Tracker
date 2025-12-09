@@ -24,6 +24,30 @@ class UltraLowMemoryLoader(Dataset):
                  min_samples_per_class: int = 1, max_annotations_per_class: int = None,
                  cache_samples: bool = False, preload_all_samples: bool = False, debug_sample_loading: bool = False,
                  time_steps: int = 8, image_height: int = 720, image_width: int = 1280, time_window_us: int = 100000,):
+        '''
+        Initialize the UltraLowMemoryLoader.
+
+        Args:
+            data_root: The root directory of the data.
+            split: The split of the data.
+            max_events_per_sample: The maximum number of events per sample.
+            annotation_dir: The directory of the annotations.
+            max_samples_per_file: The maximum number of samples per file.
+            targeted_training: Whether to use targeted training.
+            force_cpu: Whether to force the use of CPU.
+            use_3_class_annotations: Whether to use 3-class annotations.
+            use_class_balanced_sampling: Whether to use class-balanced sampling.
+            min_samples_per_class: The minimum number of samples per class.
+            max_annotations_per_class: The maximum number of annotations per class.
+            cache_samples: Whether to cache the samples.
+            preload_all_samples: Whether to preload all samples into RAM.
+            debug_sample_loading: Whether to debug the sample loading.
+            time_steps: The number of time steps.
+            image_height: The height of the image.
+            image_width: The width of the image.
+            time_window_us: The time window in microseconds.
+        '''
+
         logger.info("=== INITIALIZING ULTRA LOW MEMORY LOADER ===")
         logger.info(f"Data root: {data_root}")
         logger.info(f"Split: {split}")
@@ -1453,7 +1477,7 @@ def create_ultra_low_memory_dataloader(data_root: str, split: str = "train",
         prefetch_factor_config = 4
         persistent_workers_config = True
         pin_memory_config = True
-    
+
     # When num_workers=0, prefetch_factor must be None
     prefetch_factor_val = prefetch_factor_config if num_workers > 0 else None
     # Use config value for persistent_workers (can be disabled for small datasets)
