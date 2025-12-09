@@ -9,7 +9,7 @@ data:
   data_root: "/home/ubuntu/eTraM/eTraM/static/data"
   
   # Directory containing annotation files
-  annotation_dir: "/home/ubuntu/Traffic_Monitoring/class annotations"
+  annotation_dir: None
   
   # Training data subdirectories
   train_folders:
@@ -52,15 +52,13 @@ model:
   # Log file name (if empty, uses timestamp-based naming)
   log_file_name: "training.log"
 
-  # Tracking feature dimension
-  track_feature_dim: 128
-
 # =============================================================================
 # MODEL ARCHITECTURE
 # =============================================================================
 architecture:
-  # Number of object classes
-  num_classes: 3
+  # Number of object classes (automatically set from classes list if not specified)
+  # If not set, will be determined from the length of the classes list in config
+  num_classes: null  # null = auto-detect from classes list
 
   # Time window in microseconds
   time_window_us: 100000  # 100ms
@@ -70,9 +68,6 @@ architecture:
   
   # Tracking feature dimension
   track_feature_dim: 128
-  
-  # Model name
-  model_name: "Traffic_Monitoring_SpikeYOLO_With_Tracking"
 
 # =============================================================================
 # TRAINING PARAMETERS
@@ -138,9 +133,6 @@ training:
   
   # Validation frequency (validate every N epochs)
   validation_frequency: 1
-  
-  # Early stopping patience
-  early_stopping_patience: 5
 
 # =============================================================================
 # MODEL PRUNING
@@ -228,12 +220,9 @@ data_processing:
   # Image dimensions for coordinate normalization (default: event camera resolution)
   image_width: 1280.0
   image_height: 720.0
-
-  # Use fine-grained temporal processing
-  use_fine_grained: true
   
   # Data loading optimizations
-  prefetch_factor: 4  # Prefetch 4 batches ahead (balanced for 6 workers)
+  prefetch_factor: 4  # Prefetch batches ahead
   persistent_workers: true  # Keep workers alive between epochs for better performance
   pin_memory: true  # Faster GPU transfer with dedicated GPU
   
@@ -273,8 +262,9 @@ data_processing:
   # The selection prioritizes: 70% class balance, 30% file diversity
   # This means the model learns from diverse conditions while maintaining class balance
   
-  # Annotation type: Use 3-class annotations (in same folder as h5 files) or 8-class annotations (in annotation_dir)
-  use_3_class_annotations: true  # Set to true to use 3-class annotations from h5 file folder, false for 8-class from annotation_dir
+  # Annotation directory (optional): If provided, uses annotations from this directory
+  # If not provided or None, uses annotations from the same folder as h5 files
+  # The number of classes is automatically determined from the classes list in config
 
 # =============================================================================
 # EVALUATION PARAMETERS
@@ -286,15 +276,9 @@ evaluation:
   # Confidence threshold for detections
   confidence_threshold: 0.2  # Lowered to 0.2 to capture more predictions (especially for rare classes)
   
-  # Number of samples for evaluation
-  eval_samples: 10
-  
   # Ratio of training max_annotations_per_class to use for evaluation
   # Evaluation will use: training_max_annotations_per_class * evaluation_annotation_ratio
   evaluation_annotation_ratio: 0.2  # 20% of training max_annotations_per_class
-  
-  # Save evaluation results
-  save_results: true
 
 # =============================================================================
 # LOGGING AND MONITORING
@@ -305,15 +289,6 @@ logging:
   
   # Log format
   format: "%(asctime)s - %(levelname)s - %(message)s"
-  
-  # Save logs to file
-  save_to_file: true
-  
-  # Log file name
-  log_file: "traffic_monitoring_spikeyolo.log"
-  
-  # Print training progress
-  print_progress: true
   
   # Print every N batches (reduced for better performance)
   print_every: 10
@@ -328,35 +303,19 @@ device:
 # =============================================================================
 # CLASS NAMES
 # =============================================================================
-# 8-class names (for fine-grained annotations)
-classes_8:
-  - "Pedestrian"
-  - "Car"
-  - "Bicycle"
-  - "Bus"
-  - "Motorbike"
-  - "Truck"
-  - "Tram"
-  - "Wheelchair"
-
-# 3-class names (for coarse-grained annotations)
-# Mapping: class_id 0 = Pedestrian, class_id 1 = Vehicle, class_id 2 = Micro-mobility
-classes_3:
+# Define your classes here. The number of classes is automatically determined from this list.
+# architecture.num_classes will be automatically set to len(classes) if not explicitly set.
+# Example for 3 classes:
+# classes:
+#   - "Pedestrian"
+#   - "Vehicle"
+#   - "Micro-mobility"
+#
+# Example for 8 classes:
+classes:
   - "Pedestrian"
   - "Vehicle"
   - "Micro-mobility"
-
-# Class names (automatically selected based on use_3_class_annotations)
-# This is a compatibility field - use get_class_names() method instead
-classes:
-  - "Pedestrian"
-  - "Car"
-  - "Bicycle"
-  - "Bus"
-  - "Motorbike"
-  - "Truck"
-  - "Tram"
-  - "Wheelchair"
 
 # =============================================================================
 # PATHS FOR DIFFERENT ENVIRONMENTS
@@ -376,7 +335,6 @@ environments:
     data_root: "/home/ubuntu/eTraM/eTraM/static/data"
     annotation_dir: "/home/ubuntu/Traffic_Monitoring/class annotations"
     checkpoint_dir: "/home/ubuntu/eTraM/eTraM/static/checkpoints/New_Run_1"
-    checkpoint_file: ""
     results_dir: "/home/ubuntu/eTraM/eTraM/static/checkpoints/New_Run_1"
     logs_dir: "/home/ubuntu/eTraM/eTraM/static/checkpoints/New_Run_1"
   

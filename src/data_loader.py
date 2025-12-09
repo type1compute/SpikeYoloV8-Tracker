@@ -5,12 +5,11 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 from threading import Thread, Lock
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, Union
 import time
 import traceback
 
-# Set up logging
-logging.basicConfig(level=logging.INFO)
+# Set up logging - will be configured by calling script
 logger = logging.getLogger(__name__)
 
 class UltraLowMemoryLoader(Dataset):
@@ -21,19 +20,19 @@ class UltraLowMemoryLoader(Dataset):
                  max_events_per_sample: int = 10000, annotation_dir: str = None,
                  max_samples_per_file: int = None, targeted_training: bool = True,
                  force_cpu: bool = False,
-                 use_3_class_annotations: bool = False, use_class_balanced_sampling: bool = False,
+                 num_classes: int = 3, use_class_balanced_sampling: bool = False,
                  min_samples_per_class: int = 1, max_annotations_per_class: int = None,
                  cache_samples: bool = False, preload_all_samples: bool = False, debug_sample_loading: bool = False,
                  time_steps: int = 8, image_height: int = 720, image_width: int = 1280, time_window_us: int = 100000,):
-        print(f"=== INITIALIZING ULTRA LOW MEMORY LOADER ===")
-        print(f"Data root: {data_root}")
-        print(f"Split: {split}")
-        print(f"Max events per sample: {max_events_per_sample}")
-        print(f"Max samples per file: {max_samples_per_file}")
-        print(f"Max annotations per class: {max_annotations_per_class}")
-        print(f"Targeted training: {targeted_training}")
-        print(f"Annotation dir: {annotation_dir}")
-        print(f"Use 3-class annotations: {use_3_class_annotations}")
+        logger.info("=== INITIALIZING ULTRA LOW MEMORY LOADER ===")
+        logger.info(f"Data root: {data_root}")
+        logger.info(f"Split: {split}")
+        logger.info(f"Max events per sample: {max_events_per_sample}")
+        logger.info(f"Max samples per file: {max_samples_per_file}")
+        logger.info(f"Max annotations per class: {max_annotations_per_class}")
+        logger.info(f"Targeted training: {targeted_training}")
+        logger.info(f"Annotation dir: {annotation_dir}")
+        logger.info(f"Number of classes: {num_classes}")
 
         self.data_root = Path(data_root)
         self.split = split
@@ -45,7 +44,7 @@ class UltraLowMemoryLoader(Dataset):
         self.force_cpu = force_cpu  # Only force CPU tensor creation if explicitly requested
         # Unified device selection: CUDA if available and not forced to CPU
         self.device = torch.device('cuda' if torch.cuda.is_available() and not self.force_cpu else 'cpu')
-        self.use_3_class_annotations = use_3_class_annotations  # Switch between 8-class and 3-class annotations
+        self.num_classes = int(num_classes)  # Number of classes (dynamically determined from config)
         self.use_class_balanced_sampling = use_class_balanced_sampling  # Enable class-balanced sampling
         self.min_samples_per_class = min_samples_per_class  # Minimum samples per class
         self.cache_samples = cache_samples
@@ -65,44 +64,44 @@ class UltraLowMemoryLoader(Dataset):
 
         # Find all HDF5 files
         self.h5_files = self._find_h5_files()
-        print(f"Found {len(self.h5_files)} HDF5 files")
+        logger.info(f"Found {len(self.h5_files)} HDF5 files")
 
-        print(f"[UltraLowMemoryLoader] Using device: {self.device} (force_cpu={self.force_cpu})", flush=True)
+        logger.info(f"[UltraLowMemoryLoader] Using device: {self.device} (force_cpu={self.force_cpu})")
 
         # Calculate dynamic samples per file based on actual event count
         if self.targeted_training:
-            print("Using targeted training: Only sampling time windows with annotations", flush=True)
-            print(f"About to find annotated windows...", flush=True)
+            logger.info("Using targeted training: Only sampling time windows with annotations")
+            logger.info("About to find annotated windows...")
             self.annotated_windows = self._find_annotated_windows()
-            print(f"Finished finding annotated windows, now filtering samples...", flush=True)
+            logger.info("Finished finding annotated windows, now filtering samples...")
             self.file_samples = self._filter_samples_by_annotations()
-            print(f"Finished filtering samples", flush=True)
+            logger.info("Finished filtering samples")
         else:
-            print("Using standard training: Sampling all time windows", flush=True)
+            logger.info("Using standard training: Sampling all time windows")
             self.file_samples = self._calculate_samples_per_file()
 
         # Create mapping from sample index to file and sample within file
         self.sample_mapping = self._create_sample_mapping()
         self.total_samples = len(self.sample_mapping)
 
-        print(f"Created {self.total_samples} samples with dynamic allocation:")
+        logger.info(f"Created {self.total_samples} samples with dynamic allocation:")
         for file_path, samples in self.file_samples.items():
-            print(f"  {file_path.name}: {samples} samples")
+            logger.info(f"  {file_path.name}: {samples} samples")
 
         # PRE-LOAD ALL SAMPLES INTO RAM if requested (massive speedup!)
         if self.preload_all_samples and self.cache_samples:
-            print(f"\n{'='*60}")
-            print(f"PRE-LOADING ALL {self.total_samples} SAMPLES INTO RAM...")
-            print(f"This will take a few minutes but make training MUCH faster!")
-            print(f"{'='*60}\n")
+            logger.info(f"\n{'='*60}")
+            logger.info(f"PRE-LOADING ALL {self.total_samples} SAMPLES INTO RAM...")
+            logger.info(f"This will take a few minutes but make training MUCH faster!")
+            logger.info(f"{'='*60}\n")
             self._preload_all_windows()
-            print(f"\n{'='*60}")
-            print(f"PRE-LOADING COMPLETE! All samples cached in RAM.")
-            print(f"{'='*60}\n")
+            logger.info(f"\n{'='*60}")
+            logger.info(f"PRE-LOADING COMPLETE! All samples cached in RAM.")
+            logger.info(f"{'='*60}\n")
         elif self.preload_all_samples and not self.cache_samples:
-            print(f"WARNING: preload_all_samples=True but cache_samples=False. Preloading disabled.")
+            logger.warning("preload_all_samples=True but cache_samples=False. Preloading disabled.")
 
-        print(f"=== ULTRA LOW MEMORY LOADER INITIALIZATION COMPLETE ===")
+        logger.info("=== ULTRA LOW MEMORY LOADER INITIALIZATION COMPLETE ===")
 
     def _find_h5_files(self):
         """Find all HDF5 files, filtering by split (train/val/test) based on PARENT DIRECTORY NAME, not filename.
@@ -144,7 +143,7 @@ class UltraLowMemoryLoader(Dataset):
 
             # Debug: log which files were found from which directory
             if h5_files:
-                print(f"  Found {len(h5_files)} files in '{subdir.name}' (split: {self.split})", flush=True)
+                logger.info(f"  Found {len(h5_files)} files in '{subdir.name}' (split: {self.split})")
 
         # Final verification: ensure all files are from the correct parent directories
         verified_files = []
@@ -158,11 +157,10 @@ class UltraLowMemoryLoader(Dataset):
                 verified_files.append(f)
             else:
                 # This should never happen if logic above is correct
-                print(f"WARNING: File {f.name} in directory {f.parent.name} doesn't match split '{self.split}'",
-                      flush=True)
+                logger.warning(f"File {f.name} in directory {f.parent.name} doesn't match split '{self.split}'")
 
-        print(f"Found {len(verified_files)} HDF5 files for split '{self.split}' "
-              f"(filtered by PARENT DIRECTORY NAME, not filename)", flush=True)
+        logger.info(f"Found {len(verified_files)} HDF5 files for split '{self.split}' "
+                    f"(filtered by PARENT DIRECTORY NAME, not filename)")
         return verified_files
 
     def _calculate_samples_per_file(self):
@@ -181,9 +179,9 @@ class UltraLowMemoryLoader(Dataset):
                         samples_needed = min(samples_needed, self.max_samples_per_file)
 
                     file_samples[h5_file] = samples_needed
-                    print(f"  {h5_file.name}: {total_events:,} events -> {samples_needed} samples")
+                    logger.debug(f"  {h5_file.name}: {total_events:,} events -> {samples_needed} samples")
             except Exception as e:
-                print(f"Error reading {h5_file}: {e}")
+                logger.error(f"Error reading {h5_file}: {e}")
                 file_samples[h5_file] = 1  # Default to 1 sample if can't read
 
         return file_samples
@@ -226,17 +224,18 @@ class UltraLowMemoryLoader(Dataset):
 
             possible_paths = []
 
-            if self.use_3_class_annotations:
-                # For 3-class annotations: look in the same folder as the h5 file
+            # If annotation_dir is provided, use it (for annotations in separate directory)
+            # Otherwise, look in the same folder as the h5 file
+            if self.annotation_dir:
+                # Look in annotation directory structure
+                possible_paths.extend([
+                    self.annotation_dir / f"eight_class_annotations_{self.split}" / annotation_name,  # Split-specific subdirectory
+                    self.annotation_dir / annotation_name,  # Direct fallback
+                ])
+            else:
+                # Look in the same folder as the h5 file
                 h5_file_dir = h5_file_path.parent
                 possible_paths.append(h5_file_dir / annotation_name)
-            else:
-                # For 8-class annotations: look in the annotation directory structure
-                if self.annotation_dir:
-                    possible_paths.extend([
-                self.annotation_dir / f"eight_class_annotations_{self.split}" / annotation_name,  # Split-specific subdirectory
-                self.annotation_dir / annotation_name,  # Direct fallback
-                    ])
 
             annotation_path = None
             for path in possible_paths:
@@ -250,21 +249,21 @@ class UltraLowMemoryLoader(Dataset):
                 self._annotation_cache[h5_file_path] = annotations
                 return annotations
             else:
-                print(f"Annotation file not found for {h5_name}. Tried paths:")
+                logger.warning(f"Annotation file not found for {h5_name}. Tried paths:")
                 for path in possible_paths:
-                    print(f"  - {path}")
+                    logger.warning(f"  - {path}")
                 return None
 
         except Exception as e:
-            print(f"Error loading annotations for {h5_file_path}: {e}")
+            logger.error(f"Error loading annotations for {h5_file_path}: {e}")
             return None
 
     def _load_annotations_for_events(self, h5_file_path, events):
         """Load annotations that match the specific events temporally"""
-        # For 3-class annotations, we don't require annotation_dir
-        # For 8-class annotations, we need annotation_dir
-        if (not self.use_3_class_annotations and not self.annotation_dir) or len(events) == 0:
-            return torch.zeros((0, 8), dtype=torch.float32, device='cpu')
+        # If annotation_dir is required but not provided, return empty annotations
+        # Note: If annotation_dir is None, annotations should be in same folder as h5 files
+        if len(events) == 0:
+            return torch.zeros((0, self.num_classes + 4), dtype=torch.float32, device='cpu')
 
         try:
             # Load all annotations for the file
@@ -325,11 +324,11 @@ class UltraLowMemoryLoader(Dataset):
             targets[:, 6] = track_id  # track_id
             targets[:, 7] = t  # timestamp
 
-            print(f"Temporal matching: {len(events)} events [{start_time:.0f}-{end_time:.0f}μs] -> {len(filtered_annotations)} annotations")
+            logger.debug(f"Temporal matching: {len(events)} events [{start_time:.0f}-{end_time:.0f}μs] -> {len(filtered_annotations)} annotations")
             return targets
 
         except Exception as e:
-            print(f"Error loading temporal annotations for {h5_file_path}: {e}")
+            logger.error(f"Error loading temporal annotations for {h5_file_path}: {e}")
             return torch.zeros((0, 8), dtype=torch.float32, device='cpu')
 
     def _find_annotated_windows(self):
@@ -349,7 +348,7 @@ class UltraLowMemoryLoader(Dataset):
         # IMPORTANT: self.h5_files is already filtered by split (train/val/test) in _find_h5_files()
         # All subsequent operations (class balancing, file diversity) only work within this split
         # Store both the pairs AND the per-file timestamp maps to avoid duplicate loading
-        print(f"STEP 1: Collecting unique timestamps from all annotation files in split '{self.split}'...", flush=True)
+        logger.info(f"STEP 1: Collecting unique timestamps from all annotation files in split '{self.split}'...")
         all_timestamps = []  # List of (h5_file, timestamp) tuples - ONLY from current split
         file_timestamp_map = {}  # Pre-build this here to avoid duplicate loading - ONLY from current split
 
@@ -368,7 +367,7 @@ class UltraLowMemoryLoader(Dataset):
             for timestamp in unique_times:
                 all_timestamps.append((h5_file, timestamp))
 
-        print(f"Found {len(all_timestamps)} total unique timestamps across all files in split '{self.split}'", flush=True)
+        logger.info(f"Found {len(all_timestamps)} total unique timestamps across all files in split '{self.split}'")
 
         # STEP 2: Select timestamps based on class balancing if enabled
         # All selection operations (class balancing, file diversity) only work within the current split
@@ -380,11 +379,11 @@ class UltraLowMemoryLoader(Dataset):
             # No class balancing: use all timestamps (or limit by max_samples_per_file if set)
             if self.max_samples_per_file is not None:
                 # Limit per file if specified
-                print(f"Limiting to {self.max_samples_per_file} samples per file (no class balancing)", flush=True)
+                logger.info(f"Limiting to {self.max_samples_per_file} samples per file (no class balancing)")
                 # This will be handled in _filter_samples_by_annotations
             selected_timestamps = all_timestamps
 
-        print(f"Selected {len(selected_timestamps)} timestamps to evaluate", flush=True)
+        logger.info(f"Selected {len(selected_timestamps)} timestamps to evaluate")
 
         # STEP 3: Group selected timestamps by H5 file
         annotated_windows = {}
@@ -394,7 +393,7 @@ class UltraLowMemoryLoader(Dataset):
         # file_timestamp_map was already built in STEP 1, no need to reload annotations
 
         # STEP 4: For each selected timestamp, find its position in the file's unique timestamps
-        print("STEP 4: Mapping selected timestamps to sample indices...", flush=True)
+        logger.info("STEP 4: Mapping selected timestamps to sample indices...")
         for h5_file, selected_timestamp in selected_timestamps:
             if h5_file not in file_timestamp_map:
                 continue
@@ -410,28 +409,28 @@ class UltraLowMemoryLoader(Dataset):
                 if sample_idx not in annotated_windows[h5_file]:
                     annotated_windows[h5_file].append(sample_idx)
 
-        print(f"Completed mapping. Windows per file:", flush=True)
+        logger.info(f"Completed mapping. Windows per file:")
         for h5_file, windows in annotated_windows.items():
             if len(windows) > 0:
-                print(f"  {h5_file.name}: {len(windows)} windows", flush=True)
+                logger.info(f"  {h5_file.name}: {len(windows)} windows")
 
         return annotated_windows
 
     def _class_balanced_selection(self, all_timestamps, file_timestamp_map):
         """Select timestamps ensuring balanced annotation counts per class using per-class threads."""
-        expected_num_classes = 3 if self.use_3_class_annotations else 8
+        expected_num_classes = self.num_classes
 
         cache_key = self._build_balanced_selection_cache_key(expected_num_classes)
         cached_selection = UltraLowMemoryLoader._BALANCED_SELECTION_CACHE.get(cache_key)
         if cached_selection is not None:
-            print(f"Using cached class-balanced selection for split '{self.split}'", flush=True)
+            logger.info(f"Using cached class-balanced selection for split '{self.split}'")
             annotation_info = cached_selection.get('annotation_counts')
             if annotation_info:
-                print(f"Cached annotation counts per class: {annotation_info}", flush=True)
+                logger.debug(f"Cached annotation counts per class: {annotation_info}")
             return cached_selection['selected_timestamps'].copy()
 
-        print(f"Using class-balanced sampling to balance annotation counts per class...", flush=True)
-        print(f"Expected number of classes: {expected_num_classes} ({'3-class' if self.use_3_class_annotations else '8-class'} annotations)", flush=True)
+        logger.info(f"Using class-balanced sampling to balance annotation counts per class...")
+        logger.info(f"Expected number of classes: {expected_num_classes}")
 
         estimated_window_us = self.time_window_us
         half_window_us = estimated_window_us / 2
@@ -459,10 +458,10 @@ class UltraLowMemoryLoader(Dataset):
             if class_counts:
                 timestamp_annotation_counts[(h5_file, timestamp)] = class_counts
 
-        print(f"Processed {len(timestamp_annotation_counts)} timestamps with annotations (window {estimated_window_us/1000:.0f}ms)", flush=True)
+        logger.info(f"Processed {len(timestamp_annotation_counts)} timestamps with annotations (window {estimated_window_us/1000:.0f}ms)")
 
         if not timestamp_annotation_counts:
-            print("No annotated timestamps found for balancing. Falling back to timestamp-based balancing.", flush=True)
+            logger.warning("No annotated timestamps found for balancing. Falling back to timestamp-based balancing.")
             return self._class_balanced_selection_fallback(all_timestamps, file_timestamp_map, expected_num_classes)
 
         total_annotations_by_class = {i: 0 for i in range(expected_num_classes)}
@@ -471,20 +470,20 @@ class UltraLowMemoryLoader(Dataset):
                 if class_id in total_annotations_by_class:
                     total_annotations_by_class[class_id] += count
 
-        print(f"Total available annotations per class: {dict(sorted(total_annotations_by_class.items()))}", flush=True)
+        logger.info(f"Total available annotations per class: {dict(sorted(total_annotations_by_class.items()))}")
 
         min_class_id = min(total_annotations_by_class.keys(), key=lambda x: total_annotations_by_class[x])
         min_annotations = total_annotations_by_class[min_class_id]
         if min_annotations == 0:
-            print(f"Warning: Class {min_class_id} has no annotations available. Falling back to timestamp-based balancing.", flush=True)
+            logger.warning(f"Class {min_class_id} has no annotations available. Falling back to timestamp-based balancing.")
             return self._class_balanced_selection_fallback(all_timestamps, file_timestamp_map, expected_num_classes)
 
         if self.max_annotations_per_class is not None:
             base_target_annotations = min(min_annotations, self.max_annotations_per_class)
-            print(f"Using max_annotations_per_class={self.max_annotations_per_class} (base target {base_target_annotations})", flush=True)
+            logger.info(f"Using max_annotations_per_class={self.max_annotations_per_class} (base target {base_target_annotations})")
         else:
             base_target_annotations = min_annotations
-            print(f"Balancing to rarest class count: {base_target_annotations} annotations per class", flush=True)
+            logger.info(f"Balancing to rarest class count: {base_target_annotations} annotations per class")
 
         target_annotations_per_class_map = {}
         for class_id in range(expected_num_classes):
@@ -492,7 +491,7 @@ class UltraLowMemoryLoader(Dataset):
             target = min(base_target_annotations, available) if available > 0 else 0
             target_annotations_per_class_map[class_id] = target
 
-        print(f"Per-class targets: {dict(sorted(target_annotations_per_class_map.items()))}", flush=True)
+        logger.info(f"Per-class targets: {dict(sorted(target_annotations_per_class_map.items()))}")
 
         timestamps_by_file_and_class = {}
         for h5_file in self.h5_files:
@@ -531,17 +530,17 @@ class UltraLowMemoryLoader(Dataset):
         def class_worker(class_id: int):
             target_limit = target_annotations_per_class_map.get(class_id, 0)
             if target_limit <= 0:
-                print(f"  Class {class_id}: no target annotations (skipping)", flush=True)
+                logger.debug(f"  Class {class_id}: no target annotations (skipping)")
                 return
 
             candidates = class_candidates.get(class_id, [])
             if not candidates:
-                print(f"  Class {class_id}: no candidate timestamps found", flush=True)
+                logger.debug(f"  Class {class_id}: no candidate timestamps found")
                 return
 
             num_candidates = len(candidates)
             if num_candidates == 0:
-                print(f"  Class {class_id}: no candidate timestamps found", flush=True)
+                logger.debug(f"  Class {class_id}: no candidate timestamps found")
                 return
             max_attempts = max(num_candidates * 5, num_candidates)
             attempts = 0
@@ -591,7 +590,7 @@ class UltraLowMemoryLoader(Dataset):
                             current_annotation_counts[cid] += count
 
             with selection_lock:
-                print(f"  Class {class_id}: collected {current_annotation_counts[class_id]} annotations (target {target_limit})", flush=True)
+                logger.debug(f"  Class {class_id}: collected {current_annotation_counts[class_id]} annotations (target {target_limit})")
 
         threads = []
         for class_id in range(expected_num_classes):
@@ -603,7 +602,7 @@ class UltraLowMemoryLoader(Dataset):
             thread.join()
 
         if not selection_order:
-            print("Multi-thread class selection produced no timestamps. Falling back to timestamp-based balancing.", flush=True)
+            logger.warning("Multi-thread class selection produced no timestamps. Falling back to timestamp-based balancing.")
             return self._class_balanced_selection_fallback(all_timestamps, file_timestamp_map, expected_num_classes)
 
         unique_selected = []
@@ -642,11 +641,11 @@ class UltraLowMemoryLoader(Dataset):
                 idx -= 1
 
         if not unique_selected:
-            print("After trimming per-class limits no timestamps remain. Falling back to timestamp-based balancing.", flush=True)
+            logger.warning("After trimming per-class limits no timestamps remain. Falling back to timestamp-based balancing.")
             return self._class_balanced_selection_fallback(all_timestamps, file_timestamp_map, expected_num_classes)
 
-        print(f"Selected {len(unique_selected)} unique timestamps after multi-thread selection", flush=True)
-        print(f"Final annotation counts per class: {dict(sorted(final_annotation_counts.items()))}", flush=True)
+        logger.info(f"Selected {len(unique_selected)} unique timestamps after multi-thread selection")
+        logger.info(f"Final annotation counts per class: {dict(sorted(final_annotation_counts.items()))}")
 
         file_usage_counts = {}
         for ts_key in unique_selected:
@@ -659,26 +658,26 @@ class UltraLowMemoryLoader(Dataset):
             min_per_file = file_counts_sorted[-1][1]
             if max_per_file > 0:
                 file_diversity_ratio = min_per_file / max_per_file
-                print(f"File diversity ratio (min/max samples per file): {file_diversity_ratio:.3f} (1.0 = perfect diversity)", flush=True)
+                logger.debug(f"File diversity ratio (min/max samples per file): {file_diversity_ratio:.3f} (1.0 = perfect diversity)")
 
         if final_annotation_counts:
             max_count = max(final_annotation_counts.values())
             min_count = min(final_annotation_counts.values())
             if max_count > 0:
                 balance_ratio = min_count / max_count
-                print(f"Class balance ratio (min/max): {balance_ratio:.3f} (1.0 = perfect balance)", flush=True)
+                logger.debug(f"Class balance ratio (min/max): {balance_ratio:.3f} (1.0 = perfect balance)")
 
         found_classes = {cid for cid, count in final_annotation_counts.items() if count > 0}
         missing_classes = set(range(expected_num_classes)) - found_classes
         if missing_classes:
-            print(f"Warning: Some classes have no annotations in selected samples: {sorted(missing_classes)}", flush=True)
+            logger.warning(f"Some classes have no annotations in selected samples: {sorted(missing_classes)}")
 
         UltraLowMemoryLoader._BALANCED_SELECTION_CACHE[cache_key] = {
             'selected_timestamps': unique_selected.copy(),
             'annotation_counts': dict(sorted(final_annotation_counts.items())),
             'num_files': len(file_usage_counts)
         }
-        print(f"Cached class-balanced selection for split '{self.split}' (key length {len(cache_key)})", flush=True)
+        logger.debug(f"Cached class-balanced selection for split '{self.split}' (key length {len(cache_key)})")
 
         return unique_selected
 
@@ -691,7 +690,7 @@ class UltraLowMemoryLoader(Dataset):
             f"max_annotations_per_class={self.max_annotations_per_class}",
             f"min_samples_per_class={self.min_samples_per_class}",
             f"use_class_balanced_sampling={self.use_class_balanced_sampling}",
-            f"use_3_class_annotations={self.use_3_class_annotations}",
+            f"num_classes={self.num_classes}",
             f"targeted_training={self.targeted_training}",
             f"max_samples_per_file={self.max_samples_per_file}",
             f"files={file_list}"
@@ -700,7 +699,7 @@ class UltraLowMemoryLoader(Dataset):
 
     def _class_balanced_selection_fallback(self, all_timestamps, file_timestamp_map, expected_num_classes):
         """Fallback to original timestamp-based balancing if annotation-based fails."""
-        print("Falling back to timestamp-based class balancing...", flush=True)
+        logger.info("Falling back to timestamp-based class balancing...")
         # Group timestamps by class (original method)
         class_timestamps = {}
         for h5_file, timestamp in all_timestamps:
@@ -760,10 +759,10 @@ class UltraLowMemoryLoader(Dataset):
                     pass
 
                 file_samples[h5_file] = num_annotated_samples
-                print(f"  {h5_file.name}: {num_annotated_samples} annotated samples")
+                logger.info(f"  {h5_file.name}: {num_annotated_samples} annotated samples")
             else:
                 file_samples[h5_file] = 0
-                print(f"  {h5_file.name}: No annotations found")
+                logger.warning(f"  {h5_file.name}: No annotations found")
 
         return file_samples
 
@@ -796,7 +795,7 @@ class UltraLowMemoryLoader(Dataset):
                     class_ids = np.unique(matching['class_id'])
 
                     # Determine expected number of classes
-                    expected_num_classes = 3 if self.use_3_class_annotations else 8
+                    expected_num_classes = self.num_classes
 
                     for class_id in class_ids:
                         class_id_int = int(class_id)
@@ -808,7 +807,7 @@ class UltraLowMemoryLoader(Dataset):
                                 class_indices[class_id_int].append(sample_idx)
                         else:
                             # Warn about invalid class IDs but continue
-                            print(f"Warning: Found class ID {class_id_int} outside expected range [0, {expected_num_classes-1}]. Skipping.", flush=True)
+                            logger.warning(f"Found class ID {class_id_int} outside expected range [0, {expected_num_classes-1}]. Skipping.")
 
         # If no classes found, return original limit
         if len(class_indices) == 0:
@@ -879,7 +878,7 @@ class UltraLowMemoryLoader(Dataset):
         # Print class distribution for this file
         if len(selected_indices) > 0:
             class_counts = {}
-            expected_num_classes = 3 if self.use_3_class_annotations else 8
+            expected_num_classes = self.num_classes
 
             for sample_idx in selected_indices:
                 if sample_idx < len(unique_times):
@@ -893,7 +892,7 @@ class UltraLowMemoryLoader(Dataset):
                             # Only count valid class IDs
                             if 0 <= class_id_int < expected_num_classes:
                                 class_counts[class_id_int] = class_counts.get(class_id_int, 0) + 1
-            print(f"    {h5_file.name} class distribution: {dict(sorted(class_counts.items()))}", flush=True)
+            logger.info(f"    {h5_file.name} class distribution: {dict(sorted(class_counts.items()))}")
 
         return len(selected_indices)
 
@@ -924,17 +923,17 @@ class UltraLowMemoryLoader(Dataset):
                     samples_per_sec = (idx + 1) / elapsed if elapsed > 0 else 0
                     eta_seconds = (self.total_samples - idx - 1) / samples_per_sec if samples_per_sec > 0 else 0
 
-                    print(f"  Progress: {idx + 1}/{self.total_samples} samples ({progress_pct:.1f}%) | "
-                          f"Speed: {samples_per_sec:.1f} samples/s | "
-                          f"ETA: {eta_seconds/60:.1f} min", flush=True)
+                    logger.info(f"  Progress: {idx + 1}/{self.total_samples} samples ({progress_pct:.1f}%) | "
+                                f"Speed: {samples_per_sec:.1f} samples/s | "
+                                f"ETA: {eta_seconds/60:.1f} min")
 
             except Exception as e:
-                print(f"  Warning: Failed to preload sample {idx}: {e}", flush=True)
+                logger.warning(f"Failed to preload sample {idx}: {e}")
                 continue
 
         elapsed = time.time() - start_time
-        print(f"\nPreloading completed in {elapsed/60:.2f} minutes")
-        print(f"Average speed: {self.total_samples/elapsed:.1f} samples/second")
+        logger.info(f"\nPreloading completed in {elapsed/60:.2f} minutes")
+        logger.info(f"Average speed: {self.total_samples/elapsed:.1f} samples/second")
 
         # Calculate memory usage estimate
         if self._sample_cache:
@@ -944,7 +943,7 @@ class UltraLowMemoryLoader(Dataset):
                 item['event_timestamps'].element_size() * item['event_timestamps'].nelement()
                 for item in self._sample_cache.values()
             ) / (1024 * 1024)
-            print(f"Estimated cache size: {cache_size_mb:.1f} MB ({cache_size_mb/1024:.2f} GB)")
+            logger.info(f"Estimated cache size: {cache_size_mb:.1f} MB ({cache_size_mb/1024:.2f} GB)")
 
     def __len__(self):
         return self.total_samples
@@ -1016,7 +1015,7 @@ class UltraLowMemoryLoader(Dataset):
                 return result
 
         except Exception as e:
-            print(f"Error in _find_event_window_fast for {h5_file}: {e}")
+            logger.error(f"Error in _find_event_window_fast for {h5_file}: {e}")
             return (0, min(self.max_events_per_sample, total_events))
 
     def _load_events_batch(self, h5_file, start_idx, end_idx):
@@ -1054,7 +1053,7 @@ class UltraLowMemoryLoader(Dataset):
                 return events
 
         except Exception as e:
-            print(f"Error loading events from {h5_file}: {e}")
+            logger.error(f"Error loading events from {h5_file}: {e}")
             events = torch.zeros((0, 4), dtype=torch.float32)
             if self.force_cpu:
                 events = events.cpu()
@@ -1155,9 +1154,9 @@ class UltraLowMemoryLoader(Dataset):
                     if sample_idx in annotated_indices
                     else sample_idx + 1
                 )
-                print(f"Streaming from: {h5_file.name} (sample {local_idx}/{samples_in_file})")
+                logger.debug(f"Streaming from: {h5_file.name} (sample {local_idx}/{samples_in_file})")
             else:
-                print(f"Streaming from: {h5_file.name} (sample {sample_idx + 1}/{samples_in_file})")
+                logger.debug(f"Streaming from: {h5_file.name} (sample {sample_idx + 1}/{samples_in_file})")
 
         events = None
         target_ann_time = None
@@ -1210,7 +1209,7 @@ class UltraLowMemoryLoader(Dataset):
                         events = self._load_events_batch(h5_file, start_idx, end_idx)
 
         except Exception as e:
-            print(f"Error loading {h5_file}: {e}")
+            logger.error(f"Error loading {h5_file}: {e}")
             traceback.print_exc()
             events = torch.zeros((0, 4), dtype=torch.float32)
             if self.force_cpu:
@@ -1389,29 +1388,30 @@ def create_ultra_low_memory_dataloader(data_root: str, split: str = "train",
                                       num_workers: int = 4, shuffle: bool = False, annotation_dir: str = None,
                                       max_samples_per_file: int = None, targeted_training: bool = True,
                                       force_cpu: bool = False,
-                                      use_3_class_annotations: bool = False, drop_last: bool = True,
+                                      num_classes: int = 3, drop_last: bool = True,
                                       use_class_balanced_sampling: bool = False, min_samples_per_class: int = 1,
                                       max_annotations_per_class: int = None,
                                       cache_samples: bool = False, preload_all_samples: bool = False,
                                       debug_sample_loading: bool = False,
                                       time_steps: Optional[int] = None,
-                                      image_height: int = 720, image_width: int = 1280, time_window_us: int = 100000):
-    print(f"=== CREATING ULTRA LOW MEMORY DATALOADER ===")
-    print(f"Data root: {data_root}")
-    print(f"Split: {split}")
-    print(f"Batch size: {batch_size}")
-    print(f"Max events per sample: {max_events_per_sample}")
-    print(f"Max samples per file: {max_samples_per_file}")
-    print(f"Max annotations per class: {max_annotations_per_class}")
-    print(f"Targeted training: {targeted_training}")
-    print(f"Num workers: {num_workers}")
-    print(f"Annotation dir: {annotation_dir}")
-    print(f"Use 3-class annotations: {use_3_class_annotations}")
-    print(f"Use class-balanced sampling: {use_class_balanced_sampling}")
-    print(f"Min samples per class: {min_samples_per_class}")
-    print(f"Cache samples: {cache_samples}")
-    print(f"Time steps (T): {time_steps}")
-    print(f"Frame size (H×W): {image_height}×{image_width}")
+                                      image_height: int = 720, image_width: int = 1280, time_window_us: int = 100000,
+                                      config: Optional[Any] = None):
+    logger.info("=== CREATING ULTRA LOW MEMORY DATALOADER ===")
+    logger.info(f"Data root: {data_root}")
+    logger.info(f"Split: {split}")
+    logger.info(f"Batch size: {batch_size}")
+    logger.info(f"Max events per sample: {max_events_per_sample}")
+    logger.info(f"Max samples per file: {max_samples_per_file}")
+    logger.info(f"Max annotations per class: {max_annotations_per_class}")
+    logger.info(f"Targeted training: {targeted_training}")
+    logger.info(f"Num workers: {num_workers}")
+    logger.info(f"Annotation dir: {annotation_dir}")
+    logger.info(f"Number of classes: {num_classes}")
+    logger.info(f"Use class-balanced sampling: {use_class_balanced_sampling}")
+    logger.info(f"Min samples per class: {min_samples_per_class}")
+    logger.info(f"Cache samples: {cache_samples}")
+    logger.info(f"Time steps (T): {time_steps}")
+    logger.info(f"Frame size (H×W): {image_height}×{image_width}")
 
     if time_steps is None:
         raise ValueError("time_steps must be provided (no hardcoded default). Pass config.get_time_steps().")
@@ -1424,7 +1424,7 @@ def create_ultra_low_memory_dataloader(data_root: str, split: str = "train",
         max_samples_per_file=max_samples_per_file,
         targeted_training=targeted_training,
         force_cpu=force_cpu,  # Pass force_cpu to dataset
-        use_3_class_annotations=use_3_class_annotations,  # Pass annotation type flag
+        num_classes=num_classes,  # Pass number of classes
         use_class_balanced_sampling=use_class_balanced_sampling,  # Pass class balancing flag
         min_samples_per_class=min_samples_per_class,  # Pass minimum samples per class
         max_annotations_per_class=max_annotations_per_class,  # Pass annotation limit per class
@@ -1437,31 +1437,43 @@ def create_ultra_low_memory_dataloader(data_root: str, split: str = "train",
         time_window_us=time_window_us
     )
 
-    print(f"Dataset created with {len(dataset)} samples")
-    print(f"Force CPU: {force_cpu}")
+    logger.info(f"Dataset created with {len(dataset)} samples")
+    logger.info(f"Force CPU: {force_cpu}")
 
     # Create a collate function wrapper that captures force_cpu
     def collate_wrapper(batch):
         return custom_collate_fn(batch, force_cpu=force_cpu)
 
+    # Get DataLoader parameters from config if available, otherwise use defaults
+    if config is not None:
+        prefetch_factor_config = config.get('data_processing.prefetch_factor', 4)
+        persistent_workers_config = config.get('data_processing.persistent_workers', True)
+        pin_memory_config = config.get('data_processing.pin_memory', True)
+    else:
+        prefetch_factor_config = 4
+        persistent_workers_config = True
+        pin_memory_config = True
+    
     # When num_workers=0, prefetch_factor must be None
-    prefetch_factor_val = 4 if num_workers > 0 else None
-    # Disable persistent_workers to reduce overhead for small datasets (many spawns/joins slow down training)
-    persistent_workers_val = False
+    prefetch_factor_val = prefetch_factor_config if num_workers > 0 else None
+    # Use config value for persistent_workers (can be disabled for small datasets)
+    persistent_workers_val = persistent_workers_config
+    # Use config value for pin_memory (can be disabled to avoid CUDA errors)
+    pin_memory_val = pin_memory_config
 
     data_loader = DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
-        pin_memory=False,  # Disabled to avoid CUDA errors
+        pin_memory=pin_memory_val,  # Use config value (can be disabled to avoid CUDA errors)
         prefetch_factor=prefetch_factor_val,  # Prefetch batches for faster loading (only if using workers)
-        persistent_workers=persistent_workers_val,  # Keep workers alive
+        persistent_workers=persistent_workers_val,  # Keep workers alive between epochs
         drop_last=drop_last,  # Use drop_last parameter (False for validation to keep incomplete batches)
         collate_fn=collate_wrapper  # Use wrapper with force_cpu
     )
 
-    print(f"Ultra Low Memory DataLoader created with {len(data_loader)} batches")
-    print(f"=== ULTRA LOW MEMORY DATALOADER CREATION COMPLETE ===")
+    logger.info(f"Ultra Low Memory DataLoader created with {len(data_loader)} batches")
+    logger.info("=== ULTRA LOW MEMORY DATALOADER CREATION COMPLETE ===")
 
     return data_loader

@@ -11,26 +11,23 @@ import logging
 from pathlib import Path
 from torchvision.ops import nms
 from PIL import Image, ImageDraw
-from data_loader import create_ultra_low_memory_dataloader
 import h5py
 import traceback
 
-# # Add the spikeyolo implementation to path - MUST be at the beginning so local ultralytics is found first
-# spikeyolo_path = os.path.join(os.path.dirname(__file__), 'spikeyolo_implementation')
-# if spikeyolo_path not in sys.path:
-#     sys.path.insert(0, spikeyolo_path)
+# Add project root to path
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 
-from etram_spikeyolo_tracking import eTraMSpikeYOLOWithTracking
+from src.data_loader import create_ultra_low_memory_dataloader
+from src.etram_spikeyolo_tracking import eTraMSpikeYOLOWithTracking
 
 # Import binary (eval) SpikeYOLO modules for inference
 from ultralytics.nn.modules import yolo_spikformer_bin as Mbin
-from config_loader import ConfigLoader
+from src.config_loader import ConfigLoader
+from src.logging_utils import setup_logging
 
-# Set up logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+# Set up logging - will be initialized in main() or when class is instantiated
 logger = logging.getLogger(__name__)
 
 class TargetedModelEvaluator:
@@ -42,6 +39,20 @@ class TargetedModelEvaluator:
         self.checkpoint_path = checkpoint_path
         self.device = device
         self.model = None
+
+        # Set up file logging for evaluation
+        log_dir = self.config.get_logs_dir()
+        log_file_name = f"evaluation_{Path(checkpoint_path).stem}.log"
+        eval_logger, log_file = setup_logging(
+            log_dir=log_dir,
+            log_level="INFO",
+            log_file_name=log_file_name,
+            script_name="evaluation"
+        )
+        # Update module logger to use the new logger
+        global logger
+        logger = eval_logger
+        logger.info(f"Evaluation logging initialized. Log file: {log_file}")
 
         # Class names for visualization (corrected to match eTraM dataset)
         # Get class names from config (handles both 3-class and 8-class)
@@ -72,7 +83,7 @@ class TargetedModelEvaluator:
                 num_classes=self.config.get_num_classes(),
                 input_size=self.config.get_input_size(),
                 time_steps=self.config.get_time_steps(),
-                track_feature_dim=self.config.get('model.track_feature_dim', 128),
+                track_feature_dim=self.config.get_track_feature_dim(),
                 class_names=self.config.get_class_names(),
                 mode="eval",  # ensure eval/binary path so inference uses binary MultiSpike4
                 window_duration_us=self.config.get_window_us()
@@ -369,13 +380,14 @@ class TargetedModelEvaluator:
             annotation_dir=self.config.get_annotation_dir(),
             max_samples_per_file=samples_per_file if eval_max_annotations_per_class is None else None,
             targeted_training=True,
-            use_3_class_annotations=self.config.get('data_processing.use_3_class_annotations', False),
+            num_classes=self.config.get_num_classes(),
             use_class_balanced_sampling=use_class_balanced_sampling,
             min_samples_per_class=min_samples_per_class,
             max_annotations_per_class=eval_max_annotations_per_class,
             time_steps=self.config.get_time_steps(),
             image_height=self.config.get('data_processing.image_height', 720),
             image_width=self.config.get('data_processing.image_width', 1280),
+            config=self.config,  # Pass config for DataLoader parameters
             time_window_us=self.config.get_window_us()
         )
 
@@ -388,8 +400,8 @@ class TargetedModelEvaluator:
 
         image_height = int(self.config.get('data_processing.image_height', 720))
         image_width = int(self.config.get('data_processing.image_width', 1280))
-        conf_thres = float(self.config.get('inference.conf_threshold', 0.25))
-        iou_thres = float(self.config.get('inference.nms_iou_threshold', 0.5))
+        conf_thres = float(self.config.get('evaluation.confidence_threshold', 0.2))
+        iou_thres = float(self.config.get('evaluation.iou_threshold', 0.4))
         nc = self.config.get_num_classes()
 
         logger.info("Starting evaluation loop...")

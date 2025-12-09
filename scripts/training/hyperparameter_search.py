@@ -16,16 +16,22 @@ from pathlib import Path
 from typing import Dict, List, Any, Optional
 import yaml
 
+# Add project root to path
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
 import torch
 import torch.optim as optim
 
 # Import training components
-from config_loader import ConfigLoader as Config
-from data_loader import create_ultra_low_memory_dataloader as create_dataloader
-from yolo_loss import YOLOLoss
-from comprehensive_training import (
+from src.config_loader import ConfigLoader as Config
+from src.data_loader import create_ultra_low_memory_dataloader as create_dataloader
+from src.yolo_loss import YOLOLoss
+from src.logging_utils import setup_logging as setup_logging_unified
+from scripts.training.comprehensive_training import (
     create_model, create_optimizer_and_scheduler, train_epoch, validate_epoch,
-    save_checkpoint, warmup_learning_rate, setup_logging
+    save_checkpoint, warmup_learning_rate
 )
 
 # Try to import Optuna for advanced hyperparameter search
@@ -34,24 +40,20 @@ try:
     OPTUNA_AVAILABLE = True
 except ImportError:
     OPTUNA_AVAILABLE = False
-    print("Warning: Optuna not available. Using random search instead.")
+    logger = logging.getLogger(__name__)
+    logger.warning("Optuna not available. Using random search instead.")
 
 
 def setup_logging_for_search(log_dir: str, trial_name: str):
     """Setup logging for a specific trial."""
-    os.makedirs(log_dir, exist_ok=True)
-    log_file = os.path.join(log_dir, f"hyperparameter_search_{trial_name}.log")
-    
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler(log_file),
-            logging.StreamHandler(sys.stdout)
-        ]
+    log_file_name = f"hyperparameter_search_{trial_name}.log"
+    logger, log_file = setup_logging_unified(
+        log_dir=log_dir,
+        log_level="INFO",
+        log_file_name=log_file_name,
+        script_name="hyperparameter_search"
     )
-    
-    return logging.getLogger(__name__)
+    return logger
 
 
 class HyperparameterSearch:
@@ -189,15 +191,14 @@ class HyperparameterSearch:
             
             logger.info(f"Using device: {device}")
             
-            # Log annotation type being used and prepare for data loaders
-            use_3_class_annotations = trial_config.get('data_processing.use_3_class_annotations', False)
+            # Log number of classes being used
             num_classes = trial_config.get_num_classes()
-            logger.info(f"Using {num_classes} classes ({'3-class' if use_3_class_annotations else '8-class'} annotations)")
+            logger.info(f"Using {num_classes} classes")
             
             # Create model
             model = create_model(trial_config, device)
             
-            # Create data loaders with support for both 3-class and 8-class annotations
+            # Create data loaders - annotation_dir is used if provided in config, otherwise None (looks in same folder as h5 files)
             force_cpu = trial_config.get('device.force_cpu', False)
             use_class_balanced_sampling = trial_config.get('data_processing.use_class_balanced_sampling', False)
             min_samples_per_class = trial_config.get('data_processing.min_samples_per_class', 1)
@@ -209,11 +210,11 @@ class HyperparameterSearch:
                 max_events_per_sample=trial_config.get('data_processing.max_events_per_sample', 10000),
                 num_workers=trial_config.get('data_processing.num_workers', 8),
                 shuffle=True,
-                annotation_dir=trial_config.get_annotation_dir() if not use_3_class_annotations else None,
+                annotation_dir=trial_config.get_annotation_dir(),  # Use annotation_dir from config (can be None)
                 max_samples_per_file=trial_config.get('data_processing.max_samples_per_file', None),
                 targeted_training=trial_config.get('data_processing.targeted_training', True),
                 force_cpu=force_cpu,
-                use_3_class_annotations=use_3_class_annotations,
+                num_classes=num_classes,
                 use_class_balanced_sampling=use_class_balanced_sampling,
                 min_samples_per_class=min_samples_per_class
             )
@@ -225,11 +226,11 @@ class HyperparameterSearch:
                 max_events_per_sample=trial_config.get('data_processing.max_events_per_sample', 10000),
                 num_workers=trial_config.get('data_processing.num_workers', 8),
                 shuffle=False,
-                annotation_dir=trial_config.get_annotation_dir() if not use_3_class_annotations else None,
+                annotation_dir=trial_config.get_annotation_dir(),  # Use annotation_dir from config (can be None)
                 max_samples_per_file=trial_config.get('data_processing.max_samples_per_file', None),
                 targeted_training=trial_config.get('data_processing.targeted_training', True),
                 force_cpu=force_cpu,
-                use_3_class_annotations=use_3_class_annotations,
+                num_classes=num_classes,
                 use_class_balanced_sampling=use_class_balanced_sampling,
                 min_samples_per_class=min_samples_per_class
             )
@@ -279,8 +280,7 @@ class HyperparameterSearch:
                 scale_weights=scale_weights   # Pass multi-scale weights
             )
             
-            logger.info(f"Loss function created with {trial_config.get_num_classes()} classes "
-                       f"({'3-class' if use_3_class_annotations else '8-class'} annotations)")
+            logger.info(f"Loss function created with {trial_config.get_num_classes()} classes")
             
             # Training loop
             best_val_loss = float('inf')
@@ -449,32 +449,34 @@ class HyperparameterSearch:
     def print_summary(self):
         """Print summary of search results."""
         if not self.results:
-            print("No results to summarize.")
+            logger = logging.getLogger(__name__)
+            logger.warning("No results to summarize.")
             return
         
+        logger = logging.getLogger(__name__)
         successful_trials = [r for r in self.results if r['success']]
         
-        print("\n" + "="*80)
-        print("HYPERPARAMETER SEARCH SUMMARY")
-        print("="*80)
-        print(f"Total trials: {len(self.results)}")
-        print(f"Successful trials: {len(successful_trials)}")
-        print(f"Failed trials: {len(self.results) - len(successful_trials)}")
+        logger.info("\n" + "="*80)
+        logger.info("HYPERPARAMETER SEARCH SUMMARY")
+        logger.info("="*80)
+        logger.info(f"Total trials: {len(self.results)}")
+        logger.info(f"Successful trials: {len(successful_trials)}")
+        logger.info(f"Failed trials: {len(self.results) - len(successful_trials)}")
         
         if successful_trials:
             scores = [r['score'] for r in successful_trials]
-            print(f"\nBest validation loss: {min(scores):.6f}")
-            print(f"Worst validation loss: {max(scores):.6f}")
-            print(f"Mean validation loss: {sum(scores)/len(scores):.6f}")
+            logger.info(f"\nBest validation loss: {min(scores):.6f}")
+            logger.info(f"Worst validation loss: {max(scores):.6f}")
+            logger.info(f"Mean validation loss: {sum(scores)/len(scores):.6f}")
             
-            print(f"\nBest configuration:")
-            print(json.dumps(self.best_config, indent=2))
+            logger.info(f"\nBest configuration:")
+            logger.info(json.dumps(self.best_config, indent=2))
 
 
 def main():
     parser = argparse.ArgumentParser(description='Hyperparameter Search for Traffic_Monitoring SpikeYOLO')
     
-    parser.add_argument('--config', type=str, default='config.yaml',
+    parser.add_argument('--config', type=str, default='config/config.yaml',
                        help='Path to base config file')
     parser.add_argument('--mode', type=str, default='random', 
                        choices=['random', 'optuna'],
@@ -500,13 +502,15 @@ def main():
         best_params = searcher.run_with_optuna(epochs=args.epochs, device=args.device)
     else:
         if args.mode == 'optuna':
-            print("Warning: Optuna not available, falling back to random search")
+            logger = logging.getLogger(__name__)
+            logger.warning("Optuna not available, falling back to random search")
         best_params = searcher.run_random_search(epochs=args.epochs, device=args.device)
     
     # Print summary
     searcher.print_summary()
     
-    print(f"\nBest hyperparameters saved to: {searcher.results_dir}")
+    logger = logging.getLogger(__name__)
+    logger.info(f"\nBest hyperparameters saved to: {searcher.results_dir}")
 
 
 if __name__ == "__main__":

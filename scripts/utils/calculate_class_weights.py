@@ -3,11 +3,24 @@
 Utility to calculate class weights from training data for handling imbalanced classes.
 """
 
+import os
+import sys
+import logging
 import torch
 import numpy as np
 from pathlib import Path
 from typing import Dict, Optional
 import h5py
+
+# Add project root to path for imports
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
+from src.logging_utils import setup_logging, get_logger
+
+# Set up logging - will use console by default, can be configured by caller
+logger = get_logger(__name__)
 
 
 def calculate_class_frequencies_from_loader(dataloader, num_classes: int, max_samples: int = None):
@@ -20,7 +33,7 @@ def calculate_class_frequencies_from_loader(dataloader, num_classes: int, max_sa
     class_counts = torch.zeros(num_classes, dtype=torch.long)
     total_samples = 0
     
-    print(f"Calculating class frequencies from dataloader (max_samples={max_samples}, num_classes={num_classes})...")
+    logger.info(f"Calculating class frequencies from dataloader (max_samples={max_samples}, num_classes={num_classes})...")
     
     # Check if dataloader is empty
     # Note: We don't consume the first batch here since iterators reset
@@ -31,10 +44,10 @@ def calculate_class_frequencies_from_loader(dataloader, num_classes: int, max_sa
         first_batch = next(iter(dataloader))
         # Check if first batch has targets
         if first_batch.get('targets', None) is None:
-            print("Warning: Dataloader has no targets. Returning zero counts.")
+            logger.warning("Dataloader has no targets. Returning zero counts.")
             return class_counts, total_samples
     except StopIteration:
-        print("Warning: Dataloader is empty. Returning zero counts.")
+        logger.warning("Dataloader is empty. Returning zero counts.")
         return class_counts, total_samples
     
     # Iterate through all batches (iterator resets automatically)
@@ -65,9 +78,9 @@ def calculate_class_frequencies_from_loader(dataloader, num_classes: int, max_sa
                     total_samples += len(class_ids)
     
     if total_samples == 0:
-        print("Warning: No object instances found in dataloader. Returning zero counts.")
+        logger.warning("No object instances found in dataloader. Returning zero counts.")
     
-    print(f"Processed {total_samples} object instances across {num_classes} classes")
+    logger.info(f"Processed {total_samples} object instances across {num_classes} classes")
     return class_counts, total_samples
 
 
@@ -104,11 +117,11 @@ def calculate_class_weights_from_frequencies(class_counts: torch.Tensor, method:
                     class_weights[~non_zero_mask] = class_weights[non_zero_mask].max() if non_zero_mask.any() else 1.0
             else:
                 # All classes have zero counts - use uniform weights
-                print("Warning: All class counts are zero. Using uniform weights.")
+                logger.warning("All class counts are zero. Using uniform weights.")
                 class_weights = torch.ones(num_classes, dtype=torch.float32)
         else:
             # Total samples is zero - use uniform weights
-            print("Warning: Total samples is zero. Using uniform weights.")
+            logger.warning("Total samples is zero. Using uniform weights.")
             class_weights = torch.ones(num_classes, dtype=torch.float32)
     elif method == 'sklearn':
         # Sklearn-style balanced weights: n_samples / (n_classes * np.bincount(y))
@@ -125,11 +138,11 @@ def calculate_class_weights_from_frequencies(class_counts: torch.Tensor, method:
                     class_weights[~non_zero_mask] = class_weights[non_zero_mask].max() if non_zero_mask.any() else 1.0
             else:
                 # All classes have zero counts - use uniform weights
-                print("Warning: All class counts are zero. Using uniform weights.")
+                logger.warning("All class counts are zero. Using uniform weights.")
                 class_weights = torch.ones(num_classes, dtype=torch.float32)
         else:
             # Total samples is zero - use uniform weights
-            print("Warning: Total samples is zero. Using uniform weights.")
+            logger.warning("Total samples is zero. Using uniform weights.")
             class_weights = torch.ones(num_classes, dtype=torch.float32)
     else:
         # Uniform weights
@@ -143,7 +156,7 @@ def calculate_class_weights_from_frequencies(class_counts: torch.Tensor, method:
         class_weights = class_weights / weights_mean * num_classes
     else:
         # If all weights are zero, use uniform weights
-        print("Warning: All class weights are zero. Using uniform weights.")
+        logger.warning("All class weights are zero. Using uniform weights.")
         class_weights = torch.ones(num_classes, dtype=torch.float32)
     
     return class_weights
@@ -151,7 +164,6 @@ def calculate_class_weights_from_frequencies(class_counts: torch.Tensor, method:
 
 def calculate_class_weights_from_annotations(data_root: str, split: str = 'train', 
                                              num_classes: int = 3,
-                                             use_3_class_annotations: bool = True,
                                              annotation_dir: Optional[str] = None,
                                              max_samples: int = 10000):
     """
@@ -161,8 +173,7 @@ def calculate_class_weights_from_annotations(data_root: str, split: str = 'train
         data_root: Root directory containing HDF5 files
         split: Dataset split ('train', 'val', 'test')
         num_classes: Number of classes
-        use_3_class_annotations: Whether to use 3-class annotations
-        annotation_dir: Directory for 8-class annotations (if not using 3-class)
+        annotation_dir: Directory for annotations (if None, looks in same folder as h5 files)
         max_samples: Maximum number of annotations to process
     
     Returns:
@@ -179,8 +190,8 @@ def calculate_class_weights_from_annotations(data_root: str, split: str = 'train
     if len(h5_files) == 0:
         h5_files = sorted(data_root.glob(f"**/*{split}*.hdf5"))
     
-    print(f"Found {len(h5_files)} HDF5 files for {split} split")
-    print(f"Calculating class frequencies from annotations (max_samples={max_samples})...")
+    logger.info(f"Found {len(h5_files)} HDF5 files for {split} split")
+    logger.info(f"Calculating class frequencies from annotations (max_samples={max_samples})...")
     
     for h5_file in h5_files:
         if total_samples >= max_samples:
@@ -188,49 +199,34 @@ def calculate_class_weights_from_annotations(data_root: str, split: str = 'train
             
         # Load annotations
         annotations = None
-        if use_3_class_annotations:
-            # Look for _bbox.npy in same folder as h5 file
-            h5_name = h5_file.stem
-            annotation_name = h5_name.replace("_td", "_bbox") + ".npy"
-            annotation_path = h5_file.parent / annotation_name
-            
-            if annotation_path.exists():
-                try:
-                    ann_data = np.load(annotation_path, allow_pickle=True)
-                    if isinstance(ann_data, np.ndarray) and len(ann_data) > 0:
-                        # Annotation format: [class_id, x, y, w, h, ...]
-                        if ann_data.dtype.names is not None:
-                            # Structured array
-                            class_ids = ann_data['class_id']
-                        else:
-                            # Regular array
-                            class_ids = ann_data[:, 0] if len(ann_data.shape) > 1 else ann_data
-                        annotations = {'class_id': class_ids}
-                except Exception as e:
-                    print(f"Error loading {annotation_path}: {e}")
-                    continue
+        h5_name = h5_file.stem
+        annotation_name = h5_name.replace("_td", "_bbox") + ".npy"
+        
+        # If annotation_dir is provided, look there first, otherwise look in same folder as h5 file
+        if annotation_dir:
+            # Look in annotation directory structure
+            annotation_path = Path(annotation_dir) / f"eight_class_annotations_{split}" / annotation_name
+            if not annotation_path.exists():
+                annotation_path = Path(annotation_dir) / annotation_name
         else:
-            # 8-class annotations from annotation_dir
-            if annotation_dir:
-                h5_name = h5_file.stem
-                annotation_name = h5_name.replace("_td", "_bbox") + ".npy"
-                annotation_path = Path(annotation_dir) / f"eight_class_annotations_{split}" / annotation_name
-                
-                if not annotation_path.exists():
-                    annotation_path = Path(annotation_dir) / annotation_name
-                
-                if annotation_path.exists():
-                    try:
-                        ann_data = np.load(annotation_path, allow_pickle=True)
-                        if isinstance(ann_data, np.ndarray) and len(ann_data) > 0:
-                            if ann_data.dtype.names is not None:
-                                class_ids = ann_data['class_id']
-                            else:
-                                class_ids = ann_data[:, 0] if len(ann_data.shape) > 1 else ann_data
-                            annotations = {'class_id': class_ids}
-                    except Exception as e:
-                        print(f"Error loading {annotation_path}: {e}")
-                        continue
+            # Look in same folder as h5 file
+            annotation_path = h5_file.parent / annotation_name
+        
+        if annotation_path.exists():
+            try:
+                ann_data = np.load(annotation_path, allow_pickle=True)
+                if isinstance(ann_data, np.ndarray) and len(ann_data) > 0:
+                    # Annotation format: [class_id, x, y, w, h, ...]
+                    if ann_data.dtype.names is not None:
+                        # Structured array
+                        class_ids = ann_data['class_id']
+                    else:
+                        # Regular array
+                        class_ids = ann_data[:, 0] if len(ann_data.shape) > 1 else ann_data
+                    annotations = {'class_id': class_ids}
+            except Exception as e:
+                    logger.error(f"Error loading {annotation_path}: {e}")
+                continue
         
         if annotations is not None:
             class_ids = annotations['class_id']
@@ -243,8 +239,8 @@ def calculate_class_weights_from_annotations(data_root: str, split: str = 'train
                 if total_samples >= max_samples:
                     break
     
-    print(f"Processed {total_samples} object instances across {num_classes} classes")
-    print(f"Class distribution: {dict(enumerate(class_counts.numpy()))}")
+    logger.info(f"Processed {total_samples} object instances across {num_classes} classes")
+    logger.info(f"Class distribution: {dict(enumerate(class_counts.numpy()))}")
     
     # Calculate weights
     class_weights = calculate_class_weights_from_frequencies(class_counts, method='balanced')

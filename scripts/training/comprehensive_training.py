@@ -15,6 +15,11 @@ from datetime import datetime
 from typing import Optional
 import traceback
 
+# Add project root to path
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
 # Suppress deprecation warnings from external libraries
 warnings.filterwarnings('ignore', category=FutureWarning, module='timm')
 warnings.filterwarnings('ignore', message='.*deprecated.*', category=FutureWarning)
@@ -29,10 +34,11 @@ import torch.ao.quantization as quantization
 import numpy as np
 
 # Import our modules
-from config_loader import ConfigLoader as Config
-from data_loader import create_ultra_low_memory_dataloader as create_dataloader
-from etram_spikeyolo_tracking import eTraMSpikeYOLOWithTracking
-from yolo_loss import YOLOLoss
+from src.config_loader import ConfigLoader as Config
+from src.data_loader import create_ultra_low_memory_dataloader as create_dataloader
+from src.etram_spikeyolo_tracking import eTraMSpikeYOLOWithTracking
+from src.yolo_loss import YOLOLoss
+from src.logging_utils import setup_logging as setup_logging_unified
 
 # ---- Pruning utilities ----
 def _compute_model_sparsity(model: nn.Module) -> float:
@@ -150,67 +156,15 @@ def finalize_pruning(model):
         if isinstance(m, (nn.Conv2d, nn.Linear)) and hasattr(m, 'weight_mask'):
             prune.remove(m, 'weight')  # make pruning permanent
 
-def setup_logging(log_dir: str, log_level: str = "INFO", log_file_name: Optional[str] = None):
-    os.makedirs(log_dir, exist_ok=True)
-    
-    # Use configured log filename or default to timestamp-based
-    if log_file_name:
-        log_file = os.path.join(log_dir, log_file_name)
-    else:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_file = os.path.join(log_dir, f"training_{timestamp}.log")
-    
-    # Get root logger
-    root_logger = logging.getLogger()
-    root_logger.setLevel(getattr(logging, log_level.upper()))
-    
-    # Remove existing handlers to prevent duplicates
-    for handler in root_logger.handlers[:]:
-        root_logger.removeHandler(handler)
-        if hasattr(handler, 'close'):
-            handler.close()
-    
-    # Create formatter
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    
-    # Create file handler - ensure it writes to the log file
-    file_handler = logging.FileHandler(log_file, mode='a', encoding='utf-8')
-    file_handler.setLevel(getattr(logging, log_level.upper()))
-    file_handler.setFormatter(formatter)
-    root_logger.addHandler(file_handler)
-    
-    # Create console handler
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(getattr(logging, log_level.upper()))
-    console_handler.setFormatter(formatter)
-    root_logger.addHandler(console_handler)
-    
-    # Ensure propagation is enabled so child loggers use root logger handlers
-    # Keep propagate = True (default) so all child loggers send messages to root logger
-    # which has the file handler
-    
-    # Configure all existing loggers to use root logger handlers
-    # Get a logger for this module
-    logger = logging.getLogger(__name__)
-    logger.setLevel(getattr(logging, log_level.upper()))
-    # Don't add handlers directly - let it propagate to root logger
-    # But ensure it doesn't have conflicting handlers
-    for handler in logger.handlers[:]:
-        logger.removeHandler(handler)
-    # With propagate=True (default), messages go to root logger which has file handler
-    
-    logger.info(f"Logging initialized. Log file: {log_file}")
-    logger.info(f"Log directory: {log_dir}")
-    
-    # Force flush to ensure first message is written
-    file_handler.flush()
-    
-    # Store file_handler reference for later flushing
-    # Make it accessible via a custom attribute on the logger
-    logger._file_handler = file_handler
-    root_logger._file_handler = file_handler
-    
-    return logger, log_file
+def setup_logging(log_dir: str, log_level: str = "INFO", log_file_name: Optional[str] = None, log_format: Optional[str] = None):
+    """Setup logging - wrapper around unified logging utility."""
+    return setup_logging_unified(
+        log_dir=log_dir,
+        log_level=log_level,
+        log_file_name=log_file_name,
+        log_format=log_format,
+        script_name="training"
+    )
 
 def prepare_model_for_qat(model, config: Config, device: torch.device):
     """Prepare model for Quantization-Aware Training (QAT)."""
@@ -282,7 +236,7 @@ def create_model(config: Config, device: torch.device):
         num_classes=config.get_num_classes(),
         input_size=config.get_input_size(),
         time_steps=config.get_time_steps(),
-        track_feature_dim=config.get('model.track_feature_dim', 128),
+        track_feature_dim=config.get_track_feature_dim(),
         class_names = config.get_class_names(),
         mode="train",
         window_duration_us=config.get_window_us()
@@ -1059,7 +1013,7 @@ def save_checkpoint(model, optimizer, scheduler, epoch, train_loss, val_loss,
 def main():
     """Main training function."""
     # Load configuration first to get default values
-    config = Config('config.yaml')
+    config = Config('config/config.yaml')
     
     parser = argparse.ArgumentParser(description='Comprehensive Traffic_Monitoring SpikeYOLO Training')
     
@@ -1080,9 +1034,10 @@ def main():
     args = parser.parse_args()
     
     # Set up logging
-    # Get log file name from config if specified
+    # Get log file name and format from config if specified
     log_file_name = config.get('model.log_file_name', None)
-    logger, log_file = setup_logging(config.get_logs_dir(), args.log_level, log_file_name=log_file_name)
+    log_format = config.get('logging.format', None)
+    logger, log_file = setup_logging(config.get_logs_dir(), args.log_level, log_file_name=log_file_name, log_format=log_format)
     
     logger.info("="*80)
     logger.info("TRAFFIC_MONITORING SPIKEYOLO COMPREHENSIVE TRAINING")
@@ -1127,7 +1082,7 @@ def main():
         logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
         logger.info(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
     elif device.type == 'cpu' and not force_cpu:
-        logger.warning("Running on CPU - this may be slow. Set device.force_cpu=true in config.yaml to explicitly force CPU, or use --device cuda to use GPU if available.")
+        logger.warning("Running on CPU - this may be slow. Set device.force_cpu=true in config/config.yaml to explicitly force CPU, or use --device cuda to use GPU if available.")
     
     # Create model
     model = create_model(config, device)
@@ -1166,7 +1121,7 @@ def main():
         max_samples_per_file=config.get('data_processing.max_samples_per_file', None) if max_annotations_per_class is None else None,
         targeted_training=config.get('data_processing.targeted_training', True),
         force_cpu=force_cpu,  # Pass force_cpu flag to dataloader
-        use_3_class_annotations=config.get('data_processing.use_3_class_annotations', False),  # Pass annotation type config
+        num_classes=config.get_num_classes(),  # Pass number of classes from config
         use_class_balanced_sampling=config.get('data_processing.use_class_balanced_sampling', False),  # Pass class balancing flag
         min_samples_per_class=config.get('data_processing.min_samples_per_class', 1),  # Pass minimum samples per class
         max_annotations_per_class=max_annotations_per_class,  # Pass annotation limit per class
@@ -1176,6 +1131,7 @@ def main():
         time_steps=config.get_time_steps(),
         image_height=config.get('data_processing.image_height', 720),
         image_width=config.get('data_processing.image_width', 1280),
+        config=config,  # Pass config for DataLoader parameters
         time_window_us=config.get_window_us()
     )
     
@@ -1221,7 +1177,7 @@ def main():
         max_samples_per_file=config.get('data_processing.max_samples_per_file', None) if val_max_annotations_per_class is None else None,
         targeted_training=config.get('data_processing.targeted_training', True),
         force_cpu=force_cpu,  # Pass force_cpu flag to dataloader
-        use_3_class_annotations=config.get('data_processing.use_3_class_annotations', False),  # Pass annotation type config
+        num_classes=config.get_num_classes(),  # Pass number of classes from config
         drop_last=False,  # Don't drop incomplete batches for validation
         use_class_balanced_sampling=config.get('data_processing.use_class_balanced_sampling', False),  # Enable class balance + file diversity
         min_samples_per_class=config.get('data_processing.min_samples_per_class', 1),  # Pass minimum samples per class
@@ -1231,6 +1187,7 @@ def main():
         debug_sample_loading=config.get('data_processing.debug_sample_loading', False),
         time_steps=config.get_time_steps(),
         image_height=config.get('data_processing.image_height', 720),
+        config=config,  # Pass config for DataLoader parameters
         image_width=config.get('data_processing.image_width', 1280),
         time_window_us=config.get_window_us()
     )
@@ -1268,9 +1225,8 @@ def main():
             
             # Calculate frequencies from a sample of the training data
             num_classes = config.get_num_classes()
-            use_3_class = config.get('data_processing.use_3_class_annotations', False)
             
-            logger.info(f"Calculating class weights for {num_classes} classes ({'3-class' if use_3_class else '8-class'} annotations)")
+            logger.info(f"Calculating class weights for {num_classes} classes")
             
             max_samples_for_weights = config.get('yolo_loss.class_weight_calculation_samples', 5000)
             class_counts, total_samples = calculate_class_frequencies_from_loader(
@@ -1672,7 +1628,7 @@ def main():
         model = apply_iterative_pruning(model, epoch, args.epochs, pruning_config)
         
         # Validate less frequently for better performance
-        validation_frequency = config.get('training.validation_frequency', 2)
+        validation_frequency = config.get('training.validation_frequency', 1)
         validation_was_run = False
         if epoch % validation_frequency == 0 or epoch == args.epochs:
             val_loss = validate_epoch(model, val_loader, loss_fn, device, epoch, config)

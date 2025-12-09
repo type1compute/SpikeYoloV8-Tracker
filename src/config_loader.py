@@ -12,18 +12,53 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
+def _find_project_root(start_path: str = None) -> Path:
+    """
+    Find the project root directory by looking for common markers.
+    
+    Args:
+        start_path: Starting path for search (defaults to current file's directory)
+        
+    Returns:
+        Path to project root
+    """
+    if start_path is None:
+        start_path = os.path.dirname(os.path.abspath(__file__))
+    
+    current = Path(start_path).resolve()
+    
+    # Look for project root markers (ultralytics folder, README.md, etc.)
+    while current != current.parent:
+        if (current / 'ultralytics').exists() or (current / 'README.md').exists():
+            return current
+        current = current.parent
+    
+    # Fallback: assume we're in src/ and go up one level
+    return Path(start_path).parent
+
+
 class ConfigLoader:
     """
     Configuration loader for Traffic_Monitoring SpikeYOLO project.
     """
     
-    def __init__(self, config_path: str = "config.yaml"):
+    def __init__(self, config_path: str = None):
         """
         Initialize configuration loader.
         
         Args:
-            config_path: Path to configuration YAML file
+            config_path: Path to configuration YAML file (defaults to config/config.yaml relative to project root)
         """
+        if config_path is None:
+            project_root = _find_project_root()
+            config_path = str(project_root / 'config' / 'config.yaml')
+        elif not os.path.isabs(config_path) and not os.path.exists(config_path):
+            # If relative path doesn't exist, try relative to project root
+            project_root = _find_project_root()
+            potential_path = project_root / config_path
+            if potential_path.exists():
+                config_path = str(potential_path)
+        
         self.config_path = config_path
         self.config = self._load_config()
         self._resolve_paths()
@@ -180,27 +215,37 @@ class ConfigLoader:
     
     def get_class_names(self) -> List[str]:
         """Get list of class names."""
-        # If using 3-class annotations, return 3-class names
-        if self.get('data_processing.use_3_class_annotations', False):
-            class_names = self.get('classes_3', [])
-            if not class_names:
-                # Fallback to default 3-class names if not in config
-                # Mapping: class_id 0 = Pedestrian, class_id 1 = Vehicle, class_id 2 = Micro-mobility
-                return ["Pedestrian", "Vehicle", "Micro-mobility"]
-            return class_names
-        # Otherwise return 8-class names
-        class_names = self.get('classes_8', [])
+        # Get classes from config
+        class_names = self.get('classes', [])
         if not class_names:
-            # Fallback to 'classes' for backward compatibility
-            class_names = self.get('classes', [])
+            # Fallback: try legacy classes_3 or classes_8 for backward compatibility
+            class_names = self.get('classes_3', []) or self.get('classes_8', [])
+        if not class_names:
+            # Final fallback: default 3-class names
+            return ["Pedestrian", "Vehicle", "Micro-mobility"]
         return class_names
     
     def get_num_classes(self) -> int:
         """Get number of classes."""
-        # If using 3-class annotations, override num_classes to 3
-        if self.get('data_processing.use_3_class_annotations', False):
+        # First, try to get explicitly set num_classes
+        num_classes = self.get('architecture.num_classes')
+        if num_classes is not None:
+            return int(num_classes)
+        
+        # If not set, determine from classes list
+        class_names = self.get_class_names()
+        num_classes = len(class_names)
+        
+        if num_classes == 0:
+            # Fallback to default
             return 3
-        return self.get('architecture.num_classes', 8)
+        
+        # Update config with auto-detected value for consistency
+        if 'architecture' not in self.config:
+            self.config['architecture'] = {}
+        self.config['architecture']['num_classes'] = num_classes
+        
+        return num_classes
     
     def get_input_size(self) -> tuple[int, int]:
         """Get input size as tuple."""
@@ -326,7 +371,7 @@ class ConfigLoader:
         print("=" * 60)
 
 
-def load_config(config_path: str = "config.yaml") -> ConfigLoader:
+def load_config(config_path: str = None) -> ConfigLoader:
     """
     Load configuration from file.
     

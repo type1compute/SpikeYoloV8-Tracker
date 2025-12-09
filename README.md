@@ -13,22 +13,34 @@ A complete end-to-end pipeline for real-time object detection & tracking using e
 ##   **Project Structure**
 
 ```
-Traffic_Monitoring/
-├── ultralytics/                      # Modified BICLab SpikeYOLO implementation to accomodate Object Tracking
+Object_Detection&Tracking/
+├── ultralytics/                      # Modified BICLab SpikeYOLO implementation to accommodate Object Tracking
 │   └── nn/
 │       └── modules
 │           ├── yolo_spikformer.py    # Training Layers (With Tracking)(uses multispike)
-│           └── yolo_spikformer_bin.py #Inference Layers (With Tracking)(uses D substep binary spikes)
-├── config.yaml                       # Main configuration file
-├── config_loader.py                  # Configuration management
-├── data_loader.py                    # Data loading and preprocessing
-├── comprehensive_training.py         # Main training script
+│           └── yolo_spikformer_bin.py # Inference Layers (With Tracking)(uses D substep binary spikes)
+├── config/                           # Configuration files
+│   └── config.yaml                   # Main configuration file
+├── src/                              # Core source code
+│   ├── __init__.py
+│   ├── config_loader.py              # Configuration management
+│   ├── data_loader.py                # Data loading and preprocessing
+│   ├── logging_utils.py              # Unified logging setup
+│   └── etram_spikeyolo_tracking.py   # High-level model architecture
+├── scripts/                          # Executable scripts
+│   ├── training/                     # Training scripts
+│   │   ├── __init__.py
+│   │   ├── comprehensive_training.py # Main training script
+│   │   └── hyperparameter_search.py  # Hyperparameter search
+│   ├── evaluation/                   # Evaluation scripts
+│   │   ├── __init__.py
+│   │   └── targeted_model_evaluation.py # Targeted model evaluation
+│   └── utils/                        # Utility scripts
+│       ├── __init__.py
+│       └── calculate_class_weights.py # Class weight calculation
 ├── HDF5/                             # Event data files
 ├── class annotations/                # Training annotations for classes
-├── spikeyolo_tracking.py             # High-level model architecture  
-├── hyperparameter_search.py          # Hyperparameter search 
-├── yolo_loss.py                      # loss functions used for training 
-├── targeted_model_evaluation.py      # Targeted model evaluation code        
+├── yolo_loss.py                      # Loss functions used for training
 └── requirements.txt                  # Dependencies
 ```
 
@@ -107,20 +119,24 @@ dtype = [
 
 #### **Class Mappings**
 
-**Fine-grained 8-Class Annotations:**
-1. **Pedestrian**
-2. **Car**
-3. **Bicycle**
-4. **Bus**
-5. **Motorbike**
-6. **Truck**
-7. **Tram**
-8. **Wheelchair**
+The project now supports **dynamic class configuration** through `config.yaml`. Classes are defined in the `classes` list, and the number of classes is automatically detected. The system no longer uses fixed 3-class or 8-class annotations.
 
-**Grouped 3-Class Annotations:**
-1. **Pedestrian**
-2. **Vehicle** (Car, Bus, Truck, Tram)
-3. **Micro-mobility** (Bicycle, Motorbike, Wheelchair)
+**Example Configuration:**
+```yaml
+classes:
+  - Pedestrian
+  - Car
+  - Bicycle
+  - Bus
+  - Motorbike
+  - Truck
+  - Tram
+  - Wheelchair
+```
+
+**Previous Class Mappings (for reference):**
+- **Fine-grained 8-Class**: Pedestrian, Car, Bicycle, Bus, Motorbike, Truck, Tram, Wheelchair
+- **Grouped 3-Class**: Pedestrian, Vehicle (Car, Bus, Truck, Tram), Micro-mobility (Bicycle, Motorbike, Wheelchair)
 
 #### **Annotation Characteristics**
 - **Temporal Alignment**: Annotations synchronized with event timestamps
@@ -391,7 +407,7 @@ Model was predicting objects clustered near origin (coordinates 0,0) instead of 
 
 #### **Priority 1: Fix Localization**
 
-**1. Warmup Learning Rate Schedule** (`comprehensive_training.py`)
+**1. Warmup Learning Rate Schedule** (`scripts/training/comprehensive_training.py`)
 ```python
 def warmup_learning_rate(optimizer, epoch, warmup_epochs, base_lr):
     """Apply linear warmup learning rate."""
@@ -400,7 +416,7 @@ def warmup_learning_rate(optimizer, epoch, warmup_epochs, base_lr):
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
 ```
-- **Configuration**: `warmup_epochs: 3` in `config.yaml`
+- **Configuration**: `warmup_epochs: 3` in `config/config.yaml`
 - **Impact**: Gradual LR increase prevents cold start issues
 - **Expected**: +15-25% mAP
 
@@ -409,14 +425,14 @@ def warmup_learning_rate(optimizer, epoch, warmup_epochs, base_lr):
 - **Rationale**: Stronger emphasis on bounding box localization
 - **Expected**: +10-20% mAP
 
-**3. Increased Training Epochs** (`config.yaml`)
+**3. Increased Training Epochs** (`config/config.yaml`)
 - **Changed**: `epochs` from 5 to 25
 - **Rationale**: More time for model to learn spatial relationships with sparse event data
 - **Expected**: +10-15% mAP
 
 #### **Priority 2: Better Data**
 
-**4. Prioritized Annotated Windows** (`data_loader.py`)
+**4. Prioritized Annotated Windows** (`src/data_loader.py`)
 - **Changed**: Temporal buffer from 10% to 20%
 - **Code**:
   ```python
@@ -425,13 +441,14 @@ def warmup_learning_rate(optimizer, epoch, warmup_epochs, base_lr):
 - **Impact**: Captures more annotations per event window
 - **Expected**: +20-30% mAP
 
-**5. Increased Sample Diversity** (`config.yaml`)
+**5. Increased Sample Diversity** (`config/config.yaml`)
 - **Changed**: `max_samples_per_file` from 30 to 50
 - **Impact**: Better dataset coverage across spatial and temporal dimensions
 - **Expected**: +15-25% mAP
 
 ### **Configuration Changes**
 ```yaml
+# config/config.yaml
 training:
   epochs: 25           # Was 5
   warmup_epochs: 3      # New
@@ -470,12 +487,12 @@ data_processing:
 - **Impact**: Focuses learning on hard-to-classify examples
 - **Expected**: +10-15% mAP, especially for difficult classes
 
-**7. SGD Optimizer with Momentum** (`comprehensive_training.py`)
+**7. SGD Optimizer with Momentum** (`scripts/training/comprehensive_training.py`)
 - **Changed**: From AdamW to SGD with momentum=0.9
 - **Rationale**: Better for localization tasks with gradient accumulation
 - **Expected**: +5-10% mAP, more stable convergence
 
-**8. Cyclic Learning Rate** (`comprehensive_training.py`)
+**8. Cyclic Learning Rate** (`scripts/training/comprehensive_training.py`)
 - **Implementation**: OneCycleLR scheduler
 - **Configuration**: `max_lr = 0.002`, `pct_start = 0.3`
 - **Impact**: Helps escape poor local minima during training
@@ -496,6 +513,7 @@ data_processing:
 
 ### **Configuration Changes**
 ```yaml
+# config/config.yaml
 training:
   epochs: 25           # Was 5
   warmup_epochs: 3      # New
@@ -524,7 +542,7 @@ data_processing:
 
 ### **Priority 6: Temporal-Aware Processing**
 
-**10. Removed Temporal Aggregation** (`spikeyolo_implementation/etram_spikeyolo_tracking.py`)
+**10. Removed Temporal Aggregation** (`src/etram_spikeyolo_tracking.py`)
 - **Changed**: Removed `.mean(0)` aggregation that was averaging across temporal dimension
 - **Impact**: Model now preserves fine-grained temporal information
 - **Before**: `[T, B, C, H, W] → .mean(0) → [B, C, H, W]` (information loss)
@@ -553,17 +571,87 @@ data_processing:
 
 ---
 
+## **Recent Code Organization & Improvements**
+
+### **Project Restructuring**
+
+**1. Organized File Structure**
+- Moved core modules to `src/` directory
+- Separated scripts into `scripts/training/`, `scripts/evaluation/`, and `scripts/utils/`
+- Moved configuration to `config/` directory
+- Added `__init__.py` files for proper Python package structure
+
+**2. Dynamic Class Configuration**
+- Removed hardcoded `use_3_class_annotations` flag
+- Classes now defined dynamically in `config.yaml` via `classes` list
+- Number of classes auto-detected from configuration
+- Backward compatible with existing annotation formats
+
+**3. Unified Logging System**
+- Created `src/logging_utils.py` for centralized logging
+- All `print()` statements converted to logger calls
+- File logging enabled for all scripts (training, evaluation, hyperparameter search)
+- Consistent log format across all modules
+- Log files automatically created in `{model.logs_dir}/`
+
+**4. Configuration Cleanup**
+- Removed duplicate configuration entries
+- Removed unused configuration keys
+- Standardized configuration access through `ConfigLoader`
+- All hardcoded values replaced with config lookups
+- DataLoader parameters (prefetch_factor, persistent_workers, pin_memory) now configurable
+
+**5. Improved Code Maintainability**
+- Consistent import structure using absolute imports
+- Better separation of concerns
+- Easier to extend and modify
+
+---
+
 ##   **Quick Reference**
 
-### **One-Command Setup**
+### **Running Scripts**
 
+All scripts should be run from the project root directory. The scripts automatically handle path resolution.
 
-
-### **Start Training**
+**Training:**
 ```bash
-
 # Full training with tracking
-python3 comprehensive_training.py --slice_duration_us 100 --time_steps 8 --batch_size 8
+python3 scripts/training/comprehensive_training.py --slice_duration_us 100 --time_steps 8 --batch_size 8
+
+# Hyperparameter search
+python3 scripts/training/hyperparameter_search.py
+```
+
+**Evaluation:**
+```bash
+# Model evaluation
+python3 scripts/evaluation/targeted_model_evaluation.py --checkpoint_path /path/to/checkpoint.pt
+```
+
+**Utilities:**
+```bash
+# Calculate class weights
+python3 scripts/utils/calculate_class_weights.py
+```
+
+### **Import Structure**
+
+The project uses absolute imports from the `src` package:
+
+```python
+# In any script
+import sys
+from pathlib import Path
+
+# Add project root to path
+project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(project_root))
+
+# Import from src
+from src.config_loader import ConfigLoader
+from src.data_loader import create_ultra_low_memory_dataloader
+from src.logging_utils import setup_logging
 ```
 
 ### **Monitor GPU**
@@ -581,15 +669,36 @@ watch -n 1 nvidia-smi
 ### **Training Parameters**
 ```bash
 # High-frequency training (100μs windows)
-python comprehensive_training.py \
+python scripts/training/comprehensive_training.py \
     --slice_duration_us 100 \
     --time_steps 8 \
     --batch_size 8 \
     --max_epochs 100 \
     --learning_rate 1e-3 \
-    --device cuda \
-    
+    --device cuda
 ```
+
+### **Configuration Management**
+
+The project uses a centralized configuration system:
+
+- **Configuration File**: `config/config.yaml` - All project settings in one place
+- **Config Loader**: `src/config_loader.py` - Dynamic configuration loading with auto-detection
+- **Dynamic Classes**: Number of classes automatically detected from `classes` list in config
+- **No Hardcoded Values**: All parameters read from configuration file
+
+### **Logging System**
+
+The project uses a unified logging system:
+
+- **Logging Utility**: `src/logging_utils.py` - Centralized logging setup
+- **File Logging**: All logs saved to `{model.logs_dir}/` directory
+- **Console Logging**: Real-time output to stdout
+- **Log Files**:
+  - Training: `{model.logs_dir}/training_{timestamp}.log`
+  - Evaluation: `{model.logs_dir}/evaluation_{checkpoint_name}.log`
+  - Hyperparameter Search: `{model.logs_dir}/hyperparameter_search/hyperparameter_search_{trial_name}.log`
+- **Print Redirection**: All `print()` statements converted to logger calls for consistent logging
 
 ##   **Performance**
 
