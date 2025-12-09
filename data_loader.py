@@ -190,7 +190,14 @@ class UltraLowMemoryLoader(Dataset):
         return verified_files
 
     def _calculate_samples_per_file(self):
-        """Calculate number of samples needed for each file based on actual event count"""
+        """Calculate number of samples needed for each file based on actual event count
+        
+        Args:
+            None
+
+        Returns:
+            file_samples: A dictionary mapping each HDF5 file to the number of samples needed
+        """
         file_samples = {}
 
         for h5_file in self.h5_files:
@@ -213,7 +220,14 @@ class UltraLowMemoryLoader(Dataset):
         return file_samples
 
     def _create_sample_mapping(self):
-        """Create mapping from global sample index to (file_idx, sample_idx)"""
+        """Create mapping from global sample index to (file_idx, sample_idx)
+        
+        Args:
+            None
+
+        Returns:
+            mapping: A dictionary mapping each global sample index to a (file_idx, sample_idx) tuple
+        """
         mapping = {}
         global_idx = 0
 
@@ -237,7 +251,14 @@ class UltraLowMemoryLoader(Dataset):
         return mapping
 
     def _load_annotations(self, h5_file_path):
-        """Load ALL annotations for an HDF5 file (used internally)"""
+        """Load ALL annotations for an HDF5 file (used internally)
+        
+        Args:
+            h5_file_path: The path to the HDF5 file
+
+        Returns:
+            annotations: A dictionary of annotations
+        """
         # Check cache first
         if h5_file_path in self._annotation_cache:
             return self._annotation_cache[h5_file_path]
@@ -284,7 +305,15 @@ class UltraLowMemoryLoader(Dataset):
             return None
 
     def _load_annotations_for_events(self, h5_file_path, events):
-        """Load annotations that match the specific events temporally"""
+        """Load annotations that match the specific events temporally
+        
+        Args:
+            h5_file_path: The path to the HDF5 file
+            events: A tensor of events
+
+        Returns:
+            targets: A tensor of targets
+        """
         # For 3-class annotations, we don't require annotation_dir
         # For 8-class annotations, we need annotation_dir
         if (not self.use_3_class_annotations and not self.annotation_dir) or len(events) == 0:
@@ -368,6 +397,13 @@ class UltraLowMemoryLoader(Dataset):
         1. First, collect ALL unique timestamps from ALL annotation files in the current split (no H5 loading yet)
         2. Select timestamps with class balance and file diversity (based on max_annotations_per_class)
         3. ONLY THEN, for selected timestamps, load corresponding H5 windows
+
+        Args:
+            None
+
+        Returns:
+            annotated_windows: A dictionary mapping each HDF5 file to a list of sample indices
+            shape: {h5_file: [sample_idx, ...]}
         """
         # STEP 1: Collect all unique timestamps from all annotation files in the CURRENT SPLIT
         # IMPORTANT: self.h5_files is already filtered by split (train/val/test) in _find_h5_files()
@@ -442,7 +478,15 @@ class UltraLowMemoryLoader(Dataset):
         return annotated_windows
 
     def _class_balanced_selection(self, all_timestamps, file_timestamp_map):
-        """Select timestamps ensuring balanced annotation counts per class using per-class threads."""
+        """Select timestamps ensuring balanced annotation counts per class using per-class threads.
+        
+        Args:
+            all_timestamps: A list of (h5_file, timestamp) tuples
+            file_timestamp_map: A dictionary mapping each HDF5 file to a list of unique timestamps
+
+        Returns:
+            selected_timestamps: A list of (h5_file, timestamp) tuples
+        """
         expected_num_classes = 3 if self.use_3_class_annotations else 8
 
         cache_key = self._build_balanced_selection_cache_key(expected_num_classes)
@@ -707,7 +751,14 @@ class UltraLowMemoryLoader(Dataset):
         return unique_selected
 
     def _build_balanced_selection_cache_key(self, expected_num_classes: int) -> str:
-        """Build a cache key for class-balanced selection based on configuration and files."""
+        """Build a cache key for class-balanced selection based on configuration and files.
+        
+        Args:
+            expected_num_classes: The expected number of classes
+
+        Returns:
+            cache_key: A string representing the cache key
+        """
         file_list = tuple(sorted(str(f.resolve()) for f in self.h5_files))
         key_components = (
             f"split={self.split}",
@@ -723,7 +774,16 @@ class UltraLowMemoryLoader(Dataset):
         return "|".join(str(component) for component in key_components)
 
     def _class_balanced_selection_fallback(self, all_timestamps, file_timestamp_map, expected_num_classes):
-        """Fallback to original timestamp-based balancing if annotation-based fails."""
+        """Fallback to original timestamp-based balancing if annotation-based fails.
+        
+        Args:
+            all_timestamps: A list of (h5_file, timestamp) tuples
+            file_timestamp_map: A dictionary mapping each HDF5 file to a list of unique timestamps
+            expected_num_classes: The expected number of classes
+
+        Returns:
+            selected_timestamps: A list of (h5_file, timestamp) tuples
+        """
         print("Falling back to timestamp-based class balancing...", flush=True)
         # Group timestamps by class (original method)
         class_timestamps = {}
@@ -762,7 +822,14 @@ class UltraLowMemoryLoader(Dataset):
         return selected_timestamps
 
     def _filter_samples_by_annotations(self):
-        """Filter samples to only include those with annotations when targeted_training=True"""
+        """Filter samples to only include those with annotations when targeted_training=True
+        
+        Args:
+            None
+
+        Returns:
+            file_samples: A dictionary mapping each HDF5 file to the number of samples needed
+        """
         file_samples = {}
 
         for h5_file in self.h5_files:
@@ -792,7 +859,16 @@ class UltraLowMemoryLoader(Dataset):
         return file_samples
 
     def _apply_class_balanced_limit_per_file(self, h5_file, annotated_indices, max_samples):
-        """Apply class-balanced sampling limit per file."""
+        """Apply class-balanced sampling limit per file.
+        
+        Args:
+            h5_file: The path to the HDF5 file
+            annotated_indices: A list of sample indices
+            max_samples: The maximum number of samples
+
+        Returns:
+            len(selected_indices): The number of selected samples
+        """
         if not self.use_class_balanced_sampling or len(annotated_indices) == 0:
             return min(len(annotated_indices), max_samples)
 
@@ -931,6 +1007,12 @@ class UltraLowMemoryLoader(Dataset):
 
         Expected RAM usage: ~5-10GB for 2500 samples
         Expected speedup: 5-10x (batches from 8s -> 1-2s)
+
+        Args:
+            None
+
+        Returns:
+            None
         """
 
         start_time = time.time()
@@ -977,6 +1059,14 @@ class UltraLowMemoryLoader(Dataset):
         """
         OPTIMIZED: Use binary search on HDF5 timestamps without loading entire array.
         Returns (start_idx, end_idx) for the event window.
+
+        Args:
+            h5_file: The path to the HDF5 file
+            target_timestamp: The target timestamp
+            use_cache_key: The cache key to use
+
+        Returns:
+            result: A tuple of (start_idx, end_idx)
         """
         # Check precomputed cache first
         if use_cache_key and use_cache_key in self._event_indices_cache:
@@ -1047,6 +1137,14 @@ class UltraLowMemoryLoader(Dataset):
         """
         OPTIMIZED: Load all event arrays (x,y,t,p) in one go using fancy indexing.
         Returns stacked tensor [N, 4].
+
+        Args:
+            h5_file: The path to the HDF5 file
+            start_idx: The start index
+            end_idx: The end index
+
+        Returns:
+            events: A tensor of events
         """
         try:
             # Open with SWMR mode
@@ -1089,19 +1187,14 @@ class UltraLowMemoryLoader(Dataset):
         ON events contribute +1, OFF events contribute -1. Binning is uniform in time.
         If self.time_steps is unavailable, defaults to 8. Image size defaults to 720x1280
         unless self.image_height/self.image_width are defined.
-        """
-        # Determine output geometry
-        if not hasattr(self, 'time_steps'):
-            raise ValueError("UltraLowMemoryLoader.time_steps is not set. "
-                             "Ensure the dataset was constructed with a valid time_steps.")
-        T = int(self.time_steps)
-        H = getattr(self, 'image_height', 720)
-        W = getattr(self, 'image_width', 1280)
 
-        # Create empty frames on CPU by default; move to events.device if needed later
-        device = events.device
-        dtype = torch.float32
-        frames = torch.zeros((T, H, W), dtype=dtype, device=device)
+        Args:
+            events: A tensor of events
+
+        Returns:
+            frames: A tensor of frames [T,H,W]
+            shape: (T, H, W)  
+            """
 
         # Handle empty window
         if events.numel() == 0:
@@ -1155,6 +1248,14 @@ class UltraLowMemoryLoader(Dataset):
         return frames
 
     def __getitem__(self, idx):# Use the new mapping system
+        """Get an item from the dataset
+        
+        Args:
+            idx: The index of the item
+
+        Returns:
+            item: A dictionary containing the item
+        """
         file_idx, sample_idx = self.sample_mapping[idx]
         h5_file = self.h5_files[file_idx]
         samples_in_file = self.file_samples[h5_file]
@@ -1273,7 +1374,16 @@ class UltraLowMemoryLoader(Dataset):
         }
 
     def _get_event_indices(self, events_group, sample_idx, total_events):
-        """Get event indices using sliding window approach (for non-targeted training)"""
+        """Get event indices using sliding window approach (for non-targeted training) 
+        
+        Args:
+            events_group: The events group
+            sample_idx: The sample index
+            total_events: The total number of events
+
+        Returns:
+            indices: A list of event indices
+        """
         if total_events <= self.max_events_per_sample:
             return np.arange(total_events)
         else:
@@ -1290,7 +1400,15 @@ class UltraLowMemoryLoader(Dataset):
             return np.arange(start_idx, end_idx)
 
 def custom_collate_fn(batch, force_cpu=False):
-    """Custom collate function to handle variable-sized event tensors"""
+    """Custom collate function to handle variable-sized event tensors
+    
+    Args:
+        batch: A list of items
+        force_cpu: Whether to force the tensors to CPU
+
+    Returns:
+        item: A dictionary containing the item
+    """
     events = [item["events"] for item in batch]
     targets = [item["targets"] for item in batch]
     event_timestamps = [item["event_timestamps"] for item in batch]  # NEW
