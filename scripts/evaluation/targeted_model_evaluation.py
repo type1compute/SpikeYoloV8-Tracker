@@ -235,6 +235,16 @@ class TargetedModelEvaluator:
                     logger.info(f"Limiting events from {len(filtered_events)} to {max_events}")
                     filtered_events = filtered_events[:max_events]
 
+                # Explicitly delete intermediate arrays to free memory
+                del x, y, t, p, filtered_x, filtered_y, filtered_t, filtered_p, time_mask, filtered_indices
+                import gc
+                gc.collect()
+                
+                # Clear CUDA cache if available
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
                 logger.info(f"Loaded {len(filtered_events)} events from time window {start_time}-{end_time}")
                 return filtered_events
 
@@ -408,8 +418,8 @@ class TargetedModelEvaluator:
         with torch.no_grad():
             for batch_idx, batch in enumerate(test_loader):
                 try:
-                    # Raw events [B, N, 4] are kept on CPU for timestamps / debugging only
-                    events = batch['events']  # [B, N, 4]
+                    # Raw events are no longer included in batch to save memory
+                    # Only frames [B, T, H, W] are returned, which is what the model uses
                     frames = batch.get('frames', None)  # [B, T, H, W] signed spike frames
                     targets = batch['targets'].to(self.device)  # [B, N, 8]
                     event_timestamps = batch.get('event_timestamps', None)

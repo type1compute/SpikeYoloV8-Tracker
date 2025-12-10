@@ -1000,9 +1000,12 @@ class eTraMSpikeYOLOWithTracking(nn.Module):
             # Split accumulated event values into ON/OFF channels
             # Channel 0: Positive values (ON events) = max(0, x)
             # Channel 1: Negative values (OFF events) = max(0, -x)
+            # MEMORY OPTIMIZATION: Process in-place where possible to reduce memory usage
             x_on = torch.clamp(x, min=0)   # ON events (positive values)
             x_off = torch.clamp(-x, min=0)  # OFF events (negative values, made positive)
             x = torch.stack([x_on, x_off], dim=2)  # [B, T, 2, H, W]
+            # Clear intermediate tensors to help garbage collection
+            del x_on, x_off
         elif x.dim() == 5:  # [B, T, C, H, W] - already has channels
             # Ensure it has 2 channels (ON/OFF)
             if x.shape[2] != 2:

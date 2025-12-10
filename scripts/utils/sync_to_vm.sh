@@ -2,7 +2,7 @@
 
 # Sync Traffic Monitoring repository to VM with temporal-aware changes
 
-VM_IP="209.20.157.186"
+VM_IP="209.20.159.8"
 VM_USER="ubuntu"
 SSH_KEY="~/.ssh/lambda-cloud-ssh.pem"
 REMOTE_PATH="/home/ubuntu/Traffic_Monitoring"

@@ -408,11 +408,20 @@ def train_epoch(model, train_loader, optimizer, loss_fn, device, epoch, config, 
         total_data_time += data_time
         try:
             # Move data to device (explicitly move to CPU first if device is CPU to avoid CUDA context issues)
+            # Use frames - frames are [B, T, H, W] which is what the model expects
+            # Raw events are no longer included in the batch to save memory
+            if 'frames' not in batch or batch['frames'] is None:
+                raise ValueError("Frames not found in batch. This should not happen - frames are required for model input.")
+            
+            # Use pre-computed frames (memory efficient)
             if device.type == 'cpu':
-                events = batch['events'].cpu().to(device)
+                events = batch['frames'].cpu().to(device)  # frames are [B, T, H, W]
+            else:
+                events = batch['frames'].to(device)
+            
+            if device.type == 'cpu':
                 targets = batch['targets'].cpu().to(device)  # Move targets to device first
             else:
-                events = batch['events'].to(device)
                 targets = batch['targets'].to(device)  # Move targets to device first
 
             # Convert inputs to FP16 if model is FP16 (direct FP16 training)
@@ -484,6 +493,24 @@ def train_epoch(model, train_loader, optimizer, loss_fn, device, epoch, config, 
                     if device.type == 'cuda':
                         torch.cuda.empty_cache()
                         logger.warning("Cleared CUDA cache after OOM error in forward pass")
+                
+                # CRITICAL: Delete batch tensors even on forward error to free memory
+                try:
+                    if 'events' in locals():
+                        del events
+                    if 'targets' in locals():
+                        del targets
+                    if 'targets_list' in locals():
+                        del targets_list
+                    if 'batch' in locals():
+                        del batch
+                except NameError:
+                    pass
+                import gc
+                gc.collect()
+                if device.type == 'cuda':
+                    torch.cuda.empty_cache()
+                
                 batch_start_time = time.time()
                 continue
 
@@ -561,6 +588,11 @@ def train_epoch(model, train_loader, optimizer, loss_fn, device, epoch, config, 
                 optimizer.zero_grad()  # Zero gradients for next accumulation cycle
                 optimizer_time = time.time() - optimizer_start
                 total_optimizer_time += optimizer_time
+                
+                # CRITICAL: Clear CUDA cache after optimizer step to free memory
+                # This helps prevent memory fragmentation
+                if device.type == 'cuda' and batch_idx % 5 == 0:  # Every 5 optimizer steps
+                    torch.cuda.empty_cache()
 
             # Log progress (only if loss was successfully computed)
             if batch_idx % config.get('logging.print_every', 50) == 0 and 'loss' in locals() and 'loss_dict' in locals():
@@ -600,6 +632,39 @@ def train_epoch(model, train_loader, optimizer, loss_fn, device, epoch, config, 
                 if hasattr(root_logger, '_file_handler'):
                     root_logger._file_handler.flush()
 
+            # CRITICAL: Explicitly delete batch tensors to free memory immediately
+            # This prevents CUDA memory accumulation across batches
+            try:
+                del events, targets, targets_list
+            except NameError:
+                pass
+            try:
+                if 'outputs' in locals():
+                    del outputs
+                if 'predictions' in locals():
+                    del predictions
+                if 'track_features' in locals():
+                    del track_features
+                if 'loss_dict' in locals():
+                    del loss_dict
+                if 'event_timestamps' in locals():
+                    del event_timestamps
+            except NameError:
+                pass
+            # Delete the entire batch dictionary to free all references
+            try:
+                del batch
+            except NameError:
+                pass
+            
+            # Force garbage collection every N batches to free memory
+            if batch_idx % 10 == 0:  # Every 10 batches
+                import gc
+                gc.collect()
+                # Clear CUDA cache periodically to prevent fragmentation
+                if device.type == 'cuda':
+                    torch.cuda.empty_cache()
+
             # Reset timer for next batch (measure data loading time)
             batch_start_time = time.time()
 
@@ -611,6 +676,24 @@ def train_epoch(model, train_loader, optimizer, loss_fn, device, epoch, config, 
                 if device.type == 'cuda':
                     torch.cuda.empty_cache()
                     logger.warning("Cleared CUDA cache after OOM error")
+            
+            # CRITICAL: Explicitly delete batch tensors even on error to free memory
+            try:
+                if 'events' in locals():
+                    del events
+                if 'targets' in locals():
+                    del targets
+                if 'targets_list' in locals():
+                    del targets_list
+                if 'batch' in locals():
+                    del batch
+            except NameError:
+                pass
+            import gc
+            gc.collect()
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()
+            
             batch_start_time = time.time()
             continue
 
@@ -704,11 +787,15 @@ def validate_epoch(model, val_loader, loss_fn, device, epoch, config):
 
                 # Debug: Check batch contents
                 logger.info(f"Batch keys: {list(batch.keys())}")
-                logger.info(f"Events shape: {batch['events'].shape}")
+                # Use frames - raw events are no longer included in batch to save memory
+                if 'frames' not in batch or batch['frames'] is None:
+                    raise ValueError("Frames not found in batch. This should not happen - frames are required for model input.")
+                
+                logger.info(f"Frames shape: {batch['frames'].shape}")
+                events_cpu = batch['frames']  # frames are [B, T, H, W]
                 logger.info(f"Targets shape: {batch['targets'].shape}")
 
-                # Check for invalid values in events before device transfer
-                events_cpu = batch['events']
+                # Check for invalid values in events/frames before device transfer
                 if torch.isnan(events_cpu).any():
                     logger.error(f"NaN detected in events at batch {batch_idx}")
                     continue

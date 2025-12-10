@@ -9,7 +9,10 @@ data:
   data_root: "/home/ubuntu/eTraM/eTraM/static/data"
   
   # Directory containing annotation files
-  annotation_dir: None
+  # Set to null to load annotations from the same directory as the HDF5 files (recommended).
+  # Set to a path if annotations are in a separate directory structure.
+  # NOTE: This value can be overridden by environment-specific paths in the 'environments' section.
+  annotation_dir: null
   
   # Training data subdirectories
   train_folders:
@@ -76,13 +79,17 @@ training:
   # Number of training epochs (updated from hyperparameter search)
   epochs: 500
   
-  # Batch size (reduced to 20 to avoid CUDA OOM errors)
-  batch_size: 20
+  # Batch size (reduced to avoid 32-bit index math errors in model forward pass)
+  # The model flattens [T, B, C, H, W] to [T*B, C, H, W] for convolution operations
+  # With T=8, batch_size=10 gives T*B=80, which can still exceed 32-bit limits with 720×1280 spatial dims
+  # batch_size=4 with T=8 gives T*B=32, which is safe for 720×1280 spatial dimensions
+  # Use gradient_accumulation_steps to maintain effective batch size
+  batch_size: 4  # Reduced to avoid 32-bit index math errors in convolution operations
   
   # Mixed Precision Training (Automatic Mixed Precision for faster training on H100)
   # DISABLED: SpikeYOLO operations are incompatible with FP16 (causes NaN even after FP32 training)
   # Focus on other optimizations: batch size, data loading, gradient accumulation
-  use_amp: true
+  use_amp: false
   
   # Quantization-Aware Training (QAT) - DISABLED (slows training, only helps inference)
   use_quantization: false  # Disabled: QAT slows training by 5-15%
@@ -125,14 +132,14 @@ training:
   
   # Gradient accumulation steps (accumulate gradients over N batches before optimizer step)
   # This simulates a larger batch size: effective_batch_size = batch_size * gradient_accumulation_steps
-  # With batch_size=50 and accumulation=1: 50 * 1 = 50 effective batch size
-  gradient_accumulation_steps: 1
+  # With batch_size=4 and accumulation=5: 4 * 5 = 20 effective batch size (similar to original)
+  gradient_accumulation_steps: 5  # Increased to maintain effective batch size with reduced batch_size=4
   
   # Checkpoint frequency (save checkpoint every N epochs)
-  checkpoint_frequency: 1
+  checkpoint_frequency: 5
   
   # Validation frequency (validate every N epochs)
-  validation_frequency: 1
+  validation_frequency: 5
 
 # =============================================================================
 # MODEL PRUNING
@@ -227,7 +234,10 @@ data_processing:
   pin_memory: true  # Faster GPU transfer with dedicated GPU
   
   # Sample configuration
-  max_events_per_sample: 10000000  # Events per sample
+  # NOTE: max_events_per_sample is now used only as a fallback/estimate
+  # The code now uses time-based windows and can handle unlimited events per window (3-4M+)
+  # Events are processed in chunks to avoid 32-bit index math errors
+  max_events_per_sample: 10000000  # Used as fallback estimate only - actual windows use time-based limits
   max_samples_per_file: 100     # Maximum samples per HDF5 file (can lead to class imbalance when used alone)
   
   # DataLoader workers (increased for better I/O parallelization with ~60 batches)
@@ -262,9 +272,11 @@ data_processing:
   # The selection prioritizes: 70% class balance, 30% file diversity
   # This means the model learns from diverse conditions while maintaining class balance
   
-  # Annotation directory (optional): If provided, uses annotations from this directory
-  # If not provided or None, uses annotations from the same folder as h5 files
-  # The number of classes is automatically determined from the classes list in config
+  # Annotation directory behavior:
+  # - If data.annotation_dir is null (default), annotations are loaded from the same directory as the HDF5 files
+  # - If data.annotation_dir is set to a path, annotations are loaded from that directory structure
+  # - Environment-specific values in 'environments' section can override the base value
+  # - The number of classes is automatically determined from the classes list in config
 
 # =============================================================================
 # EVALUATION PARAMETERS
@@ -320,12 +332,21 @@ classes:
 # =============================================================================
 # PATHS FOR DIFFERENT ENVIRONMENTS
 # =============================================================================
-# Flat config mapping to avoid env specific path key/value duplication in other configs
+# Environment-specific paths that override the base values in 'data' and 'model' sections.
+# The active environment is determined by 'current_environment' setting below.
+# These paths automatically override:
+#   - data.data_root -> environments.{env}.data_root
+#   - data.annotation_dir -> environments.{env}.annotation_dir
+#   - model.checkpoint_dir -> environments.{env}.checkpoint_dir
+#   - model.results_dir -> environments.{env}.results_dir
+#   - model.logs_dir -> environments.{env}.logs_dir
 environments:
   # Local development environment
   local:
     data_root: "/Volumes/Extended/DevDependency/Type1Compute/MVP-Demo/Traffic_Monitoring/data"
-    annotation_dir: "/Volumes/Extended/DevDependency/Type1Compute/MVP-Demo/Traffic_Monitoring/data/class annotations"
+    # Set to null to load annotations from same directory as HDF5 files
+    # Set to a path if annotations are in a separate directory
+    annotation_dir: null
     checkpoint_dir: "./checkpoints"
     results_dir: "./results"
     logs_dir: "./logs"
@@ -333,7 +354,9 @@ environments:
   # VM/Server environment
   vm:
     data_root: "/home/ubuntu/eTraM/eTraM/static/data"
-    annotation_dir: "/home/ubuntu/Traffic_Monitoring/class annotations"
+    # Set to null to load annotations from same directory as HDF5 files
+    # Set to a path if annotations are in a separate directory
+    annotation_dir: null
     checkpoint_dir: "/home/ubuntu/eTraM/eTraM/static/checkpoints/New_Run_1"
     results_dir: "/home/ubuntu/eTraM/eTraM/static/checkpoints/New_Run_1"
     logs_dir: "/home/ubuntu/eTraM/eTraM/static/checkpoints/New_Run_1"
@@ -341,7 +364,9 @@ environments:
   # Docker environment
   docker:
     data_root: "/app/data"
-    annotation_dir: "/app/data/class annotations"
+    # Set to null to load annotations from same directory as HDF5 files
+    # Set to a path if annotations are in a separate directory
+    annotation_dir: null
     checkpoint_dir: "/app/checkpoints"
     results_dir: "/app/results"
     logs_dir: "/app/logs"

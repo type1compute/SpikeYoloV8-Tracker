@@ -90,6 +90,22 @@ class UltraLowMemoryLoader(Dataset):
         self.h5_files = self._find_h5_files()
         logger.info(f"Found {len(self.h5_files)} HDF5 files")
 
+        # Validate that files were found
+        if len(self.h5_files) == 0:
+            error_msg = (
+                f"No HDF5 files found for split '{self.split}' in data root: {self.data_root}\n"
+                f"Expected directory structure:\n"
+                f"  - For 'train' split: subdirectories named 'train_*' (e.g., train_h5_1/, train_h5_2/)\n"
+                f"  - For 'val' split: subdirectories named 'val_*' (e.g., val_h5_1/)\n"
+                f"  - For 'test' split: subdirectories named 'test_*' (e.g., test_h5_1/)\n"
+                f"Please check:\n"
+                f"  1. Data root path is correct: {self.data_root}\n"
+                f"  2. Subdirectories exist and match the split name\n"
+                f"  3. HDF5 files (*.h5) exist in those subdirectories"
+            )
+            logger.error(error_msg)
+            raise ValueError(error_msg)
+
         logger.info(f"[UltraLowMemoryLoader] Using device: {self.device} (force_cpu={self.force_cpu})")
 
         # Calculate dynamic samples per file based on actual event count
@@ -97,6 +113,7 @@ class UltraLowMemoryLoader(Dataset):
             logger.info("Using targeted training: Only sampling time windows with annotations")
             logger.info("About to find annotated windows...")
             self.annotated_windows = self._find_annotated_windows()
+            logger.info(f"Found annotated windows in {len(self.annotated_windows)} files")
             logger.info("Finished finding annotated windows, now filtering samples...")
             self.file_samples = self._filter_samples_by_annotations()
             logger.info("Finished filtering samples")
@@ -111,6 +128,32 @@ class UltraLowMemoryLoader(Dataset):
         logger.info(f"Created {self.total_samples} samples with dynamic allocation:")
         for file_path, samples in self.file_samples.items():
             logger.info(f"  {file_path.name}: {samples} samples")
+
+        # Validate that samples were created
+        if self.total_samples == 0:
+            error_msg = (
+                f"No samples created for split '{self.split}'!\n"
+                f"Found {len(self.h5_files)} HDF5 files but created 0 samples.\n"
+            )
+            if self.targeted_training:
+                error_msg += (
+                    f"Targeted training is enabled, but no annotated windows were found.\n"
+                    f"Please check:\n"
+                    f"  1. Annotation files (*_bbox.npy) exist for the HDF5 files\n"
+                    f"  2. Annotation directory is correct: {self.annotation_dir}\n"
+                    f"  3. Annotations are in the correct format\n"
+                    f"  4. Files with annotations: {len(self.annotated_windows)}/{len(self.h5_files)}"
+                )
+            else:
+                error_msg += (
+                    f"Standard training is enabled, but no samples could be calculated.\n"
+                    f"Please check:\n"
+                    f"  1. HDF5 files contain event data\n"
+                    f"  2. max_events_per_sample setting: {self.max_events_per_sample}\n"
+                    f"  3. max_samples_per_file setting: {self.max_samples_per_file}"
+                )
+            logger.error(error_msg)
+            raise ValueError(error_msg)
 
         # PRE-LOAD ALL SAMPLES INTO RAM if requested (massive speedup!)
         if self.preload_all_samples and self.cache_samples:
@@ -188,22 +231,53 @@ class UltraLowMemoryLoader(Dataset):
         return verified_files
 
     def _calculate_samples_per_file(self):
-        """Calculate number of samples needed for each file based on actual event count"""
+        """Calculate number of samples needed for each file based on time windows (not event count)
+        
+        Uses time-based windows to handle unlimited events per window.
+        """
         file_samples = {}
 
         for h5_file in self.h5_files:
             try:
                 with h5py.File(h5_file, "r") as f:
-                    total_events = len(f["events"]["x"])
-                    # Calculate samples needed to cover all events with some overlap
-                    samples_needed = max(1, (total_events + self.max_events_per_sample - 1) // self.max_events_per_sample)
+                    events_group = f["events"]
+                    total_events = len(events_group["x"])
+                    
+                    if total_events == 0:
+                        file_samples[h5_file] = 1
+                        continue
+                    
+                    # Calculate samples based on time duration, not event count
+                    # Read timestamps to determine time span
+                    chunk_size = min(100000, total_events)
+                    if total_events <= chunk_size:
+                        timestamps = events_group["t"][:]
+                        t_min = float(timestamps[0])
+                        t_max = float(timestamps[-1])
+                    else:
+                        # Sample timestamps to estimate range
+                        sample_indices = np.linspace(0, total_events - 1, min(1000, total_events), dtype=int)
+                        sample_times = events_group["t"][sample_indices]
+                        t_min = float(sample_times.min())
+                        t_max = float(sample_times.max())
+                    
+                    total_duration_us = t_max - t_min
+                    if total_duration_us <= 0:
+                        # All events at same time - use 1 sample
+                        samples_needed = 1
+                    else:
+                        # Calculate number of time windows needed
+                        time_window_us = self.time_window_us
+                        samples_needed = max(1, int(total_duration_us / time_window_us))
+                        # Add some overlap (25%)
+                        samples_needed = int(samples_needed * 1.25)
 
                     # Apply sample limit if configured
                     if self.max_samples_per_file is not None:
                         samples_needed = min(samples_needed, self.max_samples_per_file)
 
                     file_samples[h5_file] = samples_needed
-                    logger.debug(f"  {h5_file.name}: {total_events:,} events -> {samples_needed} samples")
+                    logger.debug(f"  {h5_file.name}: {total_events:,} events, {total_duration_us/1e6:.2f}s duration -> {samples_needed} samples")
             except Exception as e:
                 logger.error(f"Error reading {h5_file}: {e}")
                 file_samples[h5_file] = 1  # Default to 1 sample if can't read
@@ -282,11 +356,16 @@ class UltraLowMemoryLoader(Dataset):
             logger.error(f"Error loading annotations for {h5_file_path}: {e}")
             return None
 
-    def _load_annotations_for_events(self, h5_file_path, events):
-        """Load annotations that match the specific events temporally"""
+    def _load_annotations_for_events(self, h5_file_path, event_timestamps):
+        """Load annotations that match the specific event timestamps temporally.
+        
+        Args:
+            h5_file_path: Path to the HDF5 file
+            event_timestamps: Tensor of event timestamps [N] (not full events tensor to save memory)
+        """
         # If annotation_dir is required but not provided, return empty annotations
         # Note: If annotation_dir is None, annotations should be in same folder as h5 files
-        if len(events) == 0:
+        if len(event_timestamps) == 0:
             return torch.zeros((0, self.num_classes + 4), dtype=torch.float32, device='cpu')
 
         try:
@@ -294,9 +373,6 @@ class UltraLowMemoryLoader(Dataset):
             all_annotations = self._load_annotations(h5_file_path)
             if all_annotations is None or len(all_annotations) == 0:
                 return torch.zeros((0, 8), dtype=torch.float32, device='cpu')
-
-            # Extract timestamps from events
-            event_timestamps = events[:, 2]  # Events are [x, y, t, p], so t is index 2
 
             # Validate event_timestamps is not empty before calling min/max
             if len(event_timestamps) == 0:
@@ -348,7 +424,7 @@ class UltraLowMemoryLoader(Dataset):
             targets[:, 6] = track_id  # track_id
             targets[:, 7] = t  # timestamp
 
-            logger.debug(f"Temporal matching: {len(events)} events [{start_time:.0f}-{end_time:.0f}μs] -> {len(filtered_annotations)} annotations")
+            logger.debug(f"Temporal matching: {len(event_timestamps)} events [{start_time:.0f}-{end_time:.0f}μs] -> {len(filtered_annotations)} annotations")
             return targets
 
         except Exception as e:
@@ -373,15 +449,21 @@ class UltraLowMemoryLoader(Dataset):
         # All subsequent operations (class balancing, file diversity) only work within this split
         # Store both the pairs AND the per-file timestamp maps to avoid duplicate loading
         logger.info(f"STEP 1: Collecting unique timestamps from all annotation files in split '{self.split}'...")
+        logger.info(f"Checking {len(self.h5_files)} HDF5 files for annotations...")
         all_timestamps = []  # List of (h5_file, timestamp) tuples - ONLY from current split
         file_timestamp_map = {}  # Pre-build this here to avoid duplicate loading - ONLY from current split
+        files_with_annotations = 0
+        files_without_annotations = 0
 
         # Iterate over files that are already filtered by split (train/val/test)
         for h5_file in self.h5_files:
             annotations = self._load_annotations(h5_file)
             if annotations is None or len(annotations) == 0:
+                files_without_annotations += 1
+                logger.debug(f"  {h5_file.name}: No annotations found")
                 continue
 
+            files_with_annotations += 1
             # Get unique annotation timestamps
             annotation_times = annotations['t']
             unique_times = np.unique(annotation_times)
@@ -390,8 +472,28 @@ class UltraLowMemoryLoader(Dataset):
             # Add (file, timestamp) pairs
             for timestamp in unique_times:
                 all_timestamps.append((h5_file, timestamp))
+            
+            logger.debug(f"  {h5_file.name}: {len(unique_times)} unique timestamps, {len(annotations)} total annotations")
 
-        logger.info(f"Found {len(all_timestamps)} total unique timestamps across all files in split '{self.split}'")
+        logger.info(f"Found {len(all_timestamps)} total unique timestamps across {files_with_annotations} files in split '{self.split}'")
+        if files_without_annotations > 0:
+            logger.warning(f"{files_without_annotations} files had no annotations found")
+        
+        if len(all_timestamps) == 0:
+            error_msg = (
+                f"No annotated timestamps found for split '{self.split}'!\n"
+                f"Files checked: {len(self.h5_files)}\n"
+                f"Files with annotations: {files_with_annotations}\n"
+                f"Files without annotations: {files_without_annotations}\n"
+                f"Annotation directory: {self.annotation_dir}\n"
+                f"Please check:\n"
+                f"  1. Annotation files (*_bbox.npy) exist for the HDF5 files\n"
+                f"  2. Annotation directory path is correct: {self.annotation_dir}\n"
+                f"  3. Annotation files are in the correct format\n"
+                f"  4. Annotation files contain valid timestamps"
+            )
+            logger.error(error_msg)
+            raise ValueError(error_msg)
 
         # STEP 2: Select timestamps based on class balancing if enabled
         # All selection operations (class balancing, file diversity) only work within the current split
@@ -959,10 +1061,10 @@ class UltraLowMemoryLoader(Dataset):
         logger.info(f"\nPreloading completed in {elapsed/60:.2f} minutes")
         logger.info(f"Average speed: {self.total_samples/elapsed:.1f} samples/second")
 
-        # Calculate memory usage estimate
+        # Calculate memory usage estimate (events removed from cache to save memory)
         if self._sample_cache:
             cache_size_mb = sum(
-                item['events'].element_size() * item['events'].nelement() +
+                item['frames'].element_size() * item['frames'].nelement() +
                 item['targets'].element_size() * item['targets'].nelement() +
                 item['event_timestamps'].element_size() * item['event_timestamps'].nelement()
                 for item in self._sample_cache.values()
@@ -993,7 +1095,8 @@ class UltraLowMemoryLoader(Dataset):
                 # OPTIMIZATION 1: Use binary search on chunked reads instead of loading all timestamps
                 # Read timestamp array in chunks to find the target window efficiently
                 chunk_size = 100000  # Read 100k timestamps at a time
-                half_window = self.max_events_per_sample // 2
+                # Use time window instead of event count limit - handle unlimited events
+                half_window_us = self.time_window_us / 2  # Half the time window in microseconds
 
                 # Binary search to find approximate location
                 left, right = 0, total_events - 1
@@ -1019,16 +1122,65 @@ class UltraLowMemoryLoader(Dataset):
                 local_closest = np.argmin(local_distances)
                 closest_idx = search_start + local_closest
 
-                # Calculate window bounds
-                start_idx = max(0, closest_idx - half_window)
-                end_idx = min(total_events, closest_idx + half_window)
+                # Calculate window bounds based on TIME, not event count
+                # Load all events within the time window (can be 3-4M events)
+                target_time = float(events_group["t"][closest_idx])
+                window_start_time = target_time - half_window_us
+                window_end_time = target_time + half_window_us
 
-                # Ensure we have exactly max_events_per_sample
-                if end_idx - start_idx < self.max_events_per_sample:
-                    if end_idx == total_events:
-                        start_idx = max(0, end_idx - self.max_events_per_sample)
+                # Find all events within the time window using binary search
+                # Use chunked binary search to handle large event counts efficiently
+                # Find start index
+                left, right = 0, closest_idx
+                # Use chunked reads for binary search to avoid loading all timestamps
+                while right - left > chunk_size:
+                    mid = (left + right) // 2
+                    mid_time = float(events_group["t"][mid])
+                    if mid_time < window_start_time:
+                        left = mid
                     else:
-                        end_idx = min(total_events, start_idx + self.max_events_per_sample)
+                        right = mid
+                
+                # Final binary search on smaller range
+                while right - left > 1:
+                    mid = (left + right) // 2
+                    mid_time = float(events_group["t"][mid])
+                    if mid_time < window_start_time:
+                        left = mid + 1
+                    else:
+                        right = mid
+                start_idx = left
+
+                # Find end index
+                left, right = closest_idx, total_events - 1
+                # Use chunked reads for binary search
+                while right - left > chunk_size:
+                    mid = (left + right) // 2
+                    mid_time = float(events_group["t"][mid])
+                    if mid_time <= window_end_time:
+                        left = mid
+                    else:
+                        right = mid
+                
+                # Final binary search on smaller range
+                while right - left > 1:
+                    mid = (left + right) // 2
+                    mid_time = float(events_group["t"][mid])
+                    if mid_time <= window_end_time:
+                        left = mid + 1
+                    else:
+                        right = mid
+                end_idx = right
+
+                # Ensure we have at least some events
+                if end_idx <= start_idx:
+                    # Fallback: use a small window around the target
+                    start_idx = max(0, closest_idx - 10000)
+                    end_idx = min(total_events, closest_idx + 10000)
+
+                num_events_in_window = end_idx - start_idx
+                if num_events_in_window > 0:
+                    logger.debug(f"Time window [{window_start_time:.0f}-{window_end_time:.0f}μs] contains {num_events_in_window:,} events (unlimited)")
 
                 result = (start_idx, end_idx)
 
@@ -1040,12 +1192,18 @@ class UltraLowMemoryLoader(Dataset):
 
         except Exception as e:
             logger.error(f"Error in _find_event_window_fast for {h5_file}: {e}")
-            return (0, min(self.max_events_per_sample, total_events))
+            # Fallback: return a reasonable window (no limit on event count)
+            return (0, min(1000000, total_events))  # 1M events as safe fallback
 
     def _load_events_batch(self, h5_file, start_idx, end_idx):
         """
         OPTIMIZED: Load all event arrays (x,y,t,p) in one go using fancy indexing.
         Returns stacked tensor [N, 4].
+        NOTE: For large event counts (3-4M+), use _events_to_frames_streaming instead.
+        
+        WARNING: This method loads all events into memory at once. For large event counts,
+        this can cause CUDA OOM errors. This method should NOT be used in __getitem__.
+        Use _events_to_frames_streaming instead, which streams events in chunks.
         """
         try:
             # Open with SWMR mode
@@ -1083,11 +1241,230 @@ class UltraLowMemoryLoader(Dataset):
                 events = events.cpu()
             return events
 
+    def _events_to_frames_streaming(self, h5_file, start_idx, end_idx):
+        """
+        Stream events directly from HDF5 in chunks and accumulate frames incrementally.
+        This avoids loading all events (3-4M+) into memory at once.
+        Returns frames [T, H, W] and event_timestamps [N].
+        """
+        # Determine output geometry
+        if not hasattr(self, 'time_steps'):
+            raise ValueError("UltraLowMemoryLoader.time_steps is not set. "
+                             "Ensure the dataset was constructed with a valid time_steps.")
+        T = int(self.time_steps)
+        H = getattr(self, 'image_height', 720)
+        W = getattr(self, 'image_width', 1280)
+
+        # Create empty frames
+        # ALWAYS use CPU in DataLoader workers (forked processes cannot use CUDA)
+        # The training loop will move tensors to GPU later
+        dtype = torch.float32
+        device = 'cpu'  # Always CPU in DataLoader to avoid CUDA fork issues
+        frames = torch.zeros((T, H, W), dtype=dtype, device=device)
+
+        if start_idx >= end_idx:
+            # Return empty timestamps (min/max for annotation matching)
+            event_timestamps = torch.zeros(0, dtype=torch.float32, device=device)
+            return frames, event_timestamps
+
+        num_events = end_idx - start_idx
+        chunk_size = 100000  # Stream 100K events at a time to minimize memory usage (reduced from 500K)
+        
+        # Initialize min/max timestamps for annotation matching
+        t_min_val = None
+        t_max_val = None
+        
+        try:
+            with h5py.File(h5_file, "r", swmr=True, libver='latest') as f:
+                events_group = f["events"]
+                
+                # First pass: Get time range for binning AND annotation matching
+                # We only need min/max for annotations, not all timestamps
+                # CRITICAL: Use .copy() to break HDF5 dataset reference
+                if num_events > chunk_size * 2:
+                    # Read first chunk timestamps
+                    first_chunk_t = events_group["t"][start_idx:min(start_idx + chunk_size, end_idx)].copy()
+                    # Read last chunk timestamps
+                    last_chunk_t = events_group["t"][max(start_idx, end_idx - chunk_size):end_idx].copy()
+                    t_min = float(min(np.min(first_chunk_t), np.min(last_chunk_t)))
+                    t_max = float(max(np.max(first_chunk_t), np.max(last_chunk_t)))
+                    del first_chunk_t, last_chunk_t
+                else:
+                    # Small enough to read all timestamps at once
+                    t_all = events_group["t"][start_idx:end_idx].copy()
+                    t_min = float(np.min(t_all))
+                    t_max = float(np.max(t_all))
+                    del t_all
+                
+                # Store min/max for annotation matching (we don't need all timestamps)
+                t_min_val = t_min
+                t_max_val = t_max
+
+                # Guard against degenerate timestamps
+                if (t_max - t_min) <= 0:
+                    bin_edges = None
+                else:
+                    bin_edges = torch.linspace(t_min, t_max, T + 1, device=device)
+
+                # Second pass: Stream events in chunks and accumulate frames
+                if num_events > chunk_size:
+                    num_chunks = (num_events + chunk_size - 1) // chunk_size
+                    logger.debug(f"Streaming {num_events:,} events from HDF5 in {num_chunks} chunks to save memory")
+                    
+                    for chunk_idx in range(num_chunks):
+                        chunk_start = start_idx + chunk_idx * chunk_size
+                        chunk_end = min(start_idx + (chunk_idx + 1) * chunk_size, end_idx)
+                        
+                        # Read chunk directly from HDF5 (only this chunk in memory)
+                        # CRITICAL: Use .copy() to break HDF5 dataset reference and create independent numpy arrays
+                        x_chunk = events_group["x"][chunk_start:chunk_end].copy()
+                        y_chunk = events_group["y"][chunk_start:chunk_end].copy()
+                        t_chunk = events_group["t"][chunk_start:chunk_end].copy()
+                        p_chunk = events_group["p"][chunk_start:chunk_end].copy()
+                        
+                        # Convert to tensors - use .clone() to ensure tensor owns its memory
+                        # This breaks the numpy array reference completely
+                        x_t = torch.from_numpy(x_chunk.astype(np.float32, copy=False)).clone().to(device)
+                        y_t = torch.from_numpy(y_chunk.astype(np.float32, copy=False)).clone().to(device)
+                        t_t = torch.from_numpy(t_chunk.astype(np.float32, copy=False)).clone().to(device)
+                        p_t = torch.from_numpy(p_chunk.astype(np.float32, copy=False)).clone().to(device)
+                        
+                        # Delete numpy arrays immediately (critical for memory)
+                        # Now safe to delete since tensors have their own memory via .clone()
+                        del x_chunk, y_chunk, t_chunk, p_chunk
+                        import gc
+                        gc.collect()  # Force GC after each chunk
+                        
+                        # Explicitly clear CUDA cache if CUDA is available (safety measure)
+                        # Even though we use CPU device, this ensures no accidental CUDA allocations persist
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        
+                        # Bucketize timestamps
+                        if bin_edges is not None:
+                            b_chunk = torch.bucketize(t_t.contiguous(), bin_edges) - 1
+                            b_chunk = b_chunk.clamp_(0, T - 1)
+                        else:
+                            b_chunk = torch.full((len(t_t),), T - 1, device=device, dtype=torch.long)
+                        
+                        # Integer pixel coords
+                        xi_chunk = x_t.long().clamp_(0, W - 1)
+                        yi_chunk = y_t.long().clamp_(0, H - 1)
+                        
+                        # Signed polarity
+                        if torch.any(p_t < 0):
+                            val_chunk = p_t.to(dtype)
+                        else:
+                            val_chunk = (2.0 * p_t.to(dtype) - 1.0)
+                        
+                        # Accumulate into frames
+                        frames.index_put_((b_chunk, yi_chunk, xi_chunk), val_chunk, accumulate=True)
+                        
+                        # Delete chunk tensors immediately
+                        del x_t, y_t, t_t, p_t, b_chunk, xi_chunk, yi_chunk, val_chunk
+                        
+                        # Force garbage collection after each chunk to free memory immediately
+                        import gc
+                        gc.collect()
+                        
+                        # Explicitly clear CUDA cache if CUDA is available (safety measure)
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                else:
+                    # Small number of events - read all at once but still process efficiently
+                    # CRITICAL: Use .copy() to break HDF5 dataset reference
+                    x = events_group["x"][start_idx:end_idx].copy()
+                    y = events_group["y"][start_idx:end_idx].copy()
+                    t = events_group["t"][start_idx:end_idx].copy()
+                    p = events_group["p"][start_idx:end_idx].copy()
+                    
+                    # Convert to tensors - use .clone() to ensure tensor owns its memory
+                    x_t = torch.from_numpy(x.astype(np.float32, copy=False)).clone().to(device)
+                    y_t = torch.from_numpy(y.astype(np.float32, copy=False)).clone().to(device)
+                    t_t = torch.from_numpy(t.astype(np.float32, copy=False)).clone().to(device)
+                    p_t = torch.from_numpy(p.astype(np.float32, copy=False)).clone().to(device)
+                    
+                    # Delete numpy arrays immediately (now safe since tensors have own memory)
+                    del x, y, t, p
+                    import gc
+                    gc.collect()
+                    
+                    # Bucketize
+                    if bin_edges is not None:
+                        b = torch.bucketize(t_t.contiguous(), bin_edges) - 1
+                        b = b.clamp_(0, T - 1)
+                    else:
+                        b = torch.full((len(t_t),), T - 1, device=device, dtype=torch.long)
+                    
+                    # Integer pixel coords
+                    xi = x_t.long().clamp_(0, W - 1)
+                    yi = y_t.long().clamp_(0, H - 1)
+                    
+                    # Signed polarity
+                    if torch.any(p_t < 0):
+                        val = p_t.to(dtype)
+                    else:
+                        val = (2.0 * p_t.to(dtype) - 1.0)
+                    
+                    # Accumulate
+                    frames.index_put_((b, yi, xi), val, accumulate=True)
+                    
+                    # Delete immediately
+                    del x_t, y_t, t_t, p_t, b, xi, yi, val
+                    import gc
+                    gc.collect()
+                    
+                    # Explicitly clear CUDA cache if CUDA is available (safety measure)
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                
+                # HDF5 file handle is automatically closed by 'with' statement
+                # But explicitly clear any remaining references after processing
+                del events_group
+                import gc
+                gc.collect()
+                
+                # Explicitly clear CUDA cache after processing all events
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+        except Exception as e:
+            logger.error(f"Error streaming events from {h5_file}: {e}")
+            import traceback
+            traceback.print_exc()
+            # Return empty timestamps on error
+            event_timestamps = torch.zeros(0, dtype=torch.float32, device=device)
+            return frames, event_timestamps
+
+        # Create event_timestamps tensor with min/max for annotation matching
+        # We only need min/max, not all timestamps (saves huge memory for 3-4M events)
+        # Create a small tensor with [min, max] for _load_annotations_for_events
+        if t_min_val is not None and t_max_val is not None:
+            event_timestamps = torch.tensor([t_min_val, t_max_val], dtype=torch.float32, device=device)
+        else:
+            event_timestamps = torch.zeros(0, dtype=torch.float32, device=device)
+
+        # SCALE AND CLIP FOR SNN STABILITY
+        scale = getattr(self, "event_frame_scale", 20.0)
+        clip = getattr(self, "event_frame_clip", 4.0)
+
+        if scale is not None and scale > 0:
+            frames = frames / float(scale)
+
+        frames = frames.clamp_(-float(clip), float(clip))
+
+        return frames, event_timestamps
+
     def _events_to_frames(self, events: torch.Tensor) -> torch.Tensor:
         """Rasterize raw events [N,4]=[x,y,t,p] into signed spike frames [T,H,W].
         ON events contribute +1, OFF events contribute -1. Binning is uniform in time.
+        Processes events in chunks and immediately deletes event data to save memory.
         If self.time_steps is unavailable, defaults to 8. Image size defaults to 720x1280
         unless self.image_height/self.image_width are defined.
+        
+        WARNING: This method loads all events into memory first. For large event counts (3-4M+),
+        use _events_to_frames_streaming instead to avoid CUDA OOM errors.
+        This method is kept for backward compatibility but should not be used in __getitem__.
         """
         # Determine output geometry
         if not hasattr(self, 'time_steps'):
@@ -1106,37 +1483,115 @@ class UltraLowMemoryLoader(Dataset):
         if events.numel() == 0:
             return frames
 
-        # Expect events columns: x, y, t, p
-        x = events[:, 0]
-        y = events[:, 1]
-        t = events[:, 2]
-        p = events[:, 3]
+        num_events = events.shape[0]
+        chunk_size = 1000000  # Process 1M events at a time to avoid 32-bit limits and memory issues
+        
+        # Extract time range first (needed for binning) - use a small chunk to get min/max
+        if num_events > chunk_size:
+            # Sample first and last chunks to get time range
+            first_chunk_t = events[:min(chunk_size, num_events), 2]
+            last_chunk_t = events[max(0, num_events - chunk_size):, 2]
+            t_min = min(first_chunk_t.min().item(), last_chunk_t.min().item())
+            t_max = max(first_chunk_t.max().item(), last_chunk_t.max().item())
+            del first_chunk_t, last_chunk_t
+        else:
+            t = events[:, 2]
+            t_min = t.min().item()
+            t_max = t.max().item()
+            del t
 
         # Guard against degenerate timestamps
-        t_min = t.min()
-        t_max = t.max()
         if (t_max - t_min) <= 0:
             # Put all events into the last bin to avoid division-by-zero issues
-            b = torch.full((events.shape[0],), T - 1, device=device, dtype=torch.long)
+            bin_edges = None
         else:
-            # Build bin edges and bucketize timestamps
+            # Build bin edges for bucketizing
             bin_edges = torch.linspace(t_min, t_max, T + 1, device=device)
-            b = torch.bucketize(t.contiguous(), bin_edges) - 1  # map to [0, T-1]
-            b = b.clamp_(0, T - 1)
 
-        # Integer pixel coords with bounds check
-        xi = x.long().clamp_(0, W - 1)
-        yi = y.long().clamp_(0, H - 1)
-
-        # Signed polarity: assume p∈{-1,1}; if {0,1}, map 0->-1 via (2*p-1)
-        # Auto-detect range once
-        if torch.any(p < 0):
-            val = p.to(dtype)
+        # Process events in chunks to accumulate frames incrementally
+        # This allows us to delete event chunks immediately after processing
+        if num_events > chunk_size:
+            num_chunks = (num_events + chunk_size - 1) // chunk_size
+            logger.debug(f"Processing {num_events:,} events in {num_chunks} chunks to save memory and avoid 32-bit index limits")
+            
+            for chunk_start in range(0, num_events, chunk_size):
+                chunk_end = min(chunk_start + chunk_size, num_events)
+                
+                # Extract chunk data (creates new tensors, not views)
+                chunk_events = events[chunk_start:chunk_end].clone()  # Clone to break reference
+                x_chunk = chunk_events[:, 0]
+                y_chunk = chunk_events[:, 1]
+                t_chunk = chunk_events[:, 2]
+                p_chunk = chunk_events[:, 3]
+                
+                # Delete the chunk immediately after extracting columns
+                del chunk_events
+                
+                # Bucketize timestamps for this chunk
+                if bin_edges is not None:
+                    b_chunk = torch.bucketize(t_chunk.contiguous(), bin_edges) - 1
+                    b_chunk = b_chunk.clamp_(0, T - 1)
+                else:
+                    b_chunk = torch.full((len(t_chunk),), T - 1, device=device, dtype=torch.long)
+                
+                # Integer pixel coords with bounds check
+                xi_chunk = x_chunk.long().clamp_(0, W - 1)
+                yi_chunk = y_chunk.long().clamp_(0, H - 1)
+                
+                # Signed polarity: assume p∈{-1,1}; if {0,1}, map 0->-1 via (2*p-1)
+                if torch.any(p_chunk < 0):
+                    val_chunk = p_chunk.to(dtype)
+                else:
+                    val_chunk = (2.0 * p_chunk.to(dtype) - 1.0)
+                
+                # Accumulate into frames
+                frames.index_put_((b_chunk, yi_chunk, xi_chunk), val_chunk, accumulate=True)
+                
+                # Delete chunk tensors immediately
+                del x_chunk, y_chunk, t_chunk, p_chunk, b_chunk, xi_chunk, yi_chunk, val_chunk
+                
+                # Force garbage collection after each chunk
+                import gc
+                gc.collect()
+                
+                # Explicitly clear CUDA cache if CUDA is available
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
         else:
-            val = (2.0 * p.to(dtype) - 1.0)
-
-        # Accumulate into frames[b, y, x] as signed counts
-        frames.index_put_((b, yi, xi), val, accumulate=True)
+            # Small number of events - process all at once but still delete immediately
+            x = events[:, 0].clone()
+            y = events[:, 1].clone()
+            t = events[:, 2].clone()
+            p = events[:, 3].clone()
+            
+            # Bucketize timestamps
+            if bin_edges is not None:
+                b = torch.bucketize(t.contiguous(), bin_edges) - 1
+                b = b.clamp_(0, T - 1)
+            else:
+                b = torch.full((num_events,), T - 1, device=device, dtype=torch.long)
+            
+            # Integer pixel coords with bounds check
+            xi = x.long().clamp_(0, W - 1)
+            yi = y.long().clamp_(0, H - 1)
+            
+            # Signed polarity
+            if torch.any(p < 0):
+                val = p.to(dtype)
+            else:
+                val = (2.0 * p.to(dtype) - 1.0)
+            
+            # Accumulate into frames
+            frames.index_put_((b, yi, xi), val, accumulate=True)
+            
+            # Delete immediately
+            del x, y, t, p, b, xi, yi, val
+            import gc
+            gc.collect()
+            
+            # Explicitly clear CUDA cache if CUDA is available
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         # SCALE AND CLIP FOR SNN STABILITY:
         # Large raw counts can saturate MultiSpike4 / Integer LIF neurons.
@@ -1150,6 +1605,14 @@ class UltraLowMemoryLoader(Dataset):
 
         # Clamp to a bounded range (compatible with MultiSpike4's useful range)
         frames = frames.clamp_(-float(clip), float(clip))
+        
+        # Final cleanup - ensure all event data is freed
+        import gc
+        gc.collect()
+        
+        # Explicitly clear CUDA cache if CUDA is available
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         return frames
 
@@ -1161,8 +1624,7 @@ class UltraLowMemoryLoader(Dataset):
         if self.cache_samples and self._sample_cache is not None and cache_key in self._sample_cache:
             cached = self._sample_cache[cache_key]
             return {
-                "events": cached["events"].clone(),
-                "frames": cached["frames"].clone(),
+                "frames": cached["frames"].clone(),  # Pre-computed frames - USED BY MODEL
                 "targets": cached["targets"].clone(),
                 "event_timestamps": cached["event_timestamps"].clone(),
                 "filename": cached["filename"],
@@ -1182,7 +1644,8 @@ class UltraLowMemoryLoader(Dataset):
             else:
                 logger.debug(f"Streaming from: {h5_file.name} (sample {sample_idx + 1}/{samples_in_file})")
 
-        events = None
+        start_idx = 0
+        end_idx = 0
         target_ann_time = None
 
         try:
@@ -1200,21 +1663,18 @@ class UltraLowMemoryLoader(Dataset):
                     start_idx, end_idx = self._find_event_window_fast(
                         h5_file, target_ann_time, use_cache_key=cache_key
                     )
-                    events = self._load_events_batch(h5_file, start_idx, end_idx)
                 else:
                     # Fallback: no valid target time → sliding window
                     with h5py.File(h5_file, "r", swmr=True, libver="latest") as f:
                         events_group = f["events"]
                         total_events = len(events_group["x"])
                         if total_events == 0:
-                            events = torch.zeros((0, 4), dtype=torch.float32)
-                            if self.force_cpu:
-                                events = events.cpu()
+                            start_idx = 0
+                            end_idx = 0
                         else:
                             indices = self._get_event_indices(events_group, sample_idx, total_events)
                             start_idx = indices[0] if len(indices) > 0 else 0
                             end_idx = indices[-1] + 1 if len(indices) > 0 else 0
-                            events = self._load_events_batch(h5_file, start_idx, end_idx)
 
             else:
                 # No annotations → sliding window method
@@ -1223,48 +1683,56 @@ class UltraLowMemoryLoader(Dataset):
                     total_events = len(events_group["x"])
 
                     if total_events == 0:
-                        events = torch.zeros((0, 4), dtype=torch.float32)
-                        if self.force_cpu:
-                            events = events.cpu()
+                        start_idx = 0
+                        end_idx = 0
                     else:
                         indices = self._get_event_indices(events_group, sample_idx, total_events)
                         start_idx = indices[0] if len(indices) > 0 else 0
                         end_idx = indices[-1] + 1 if len(indices) > 0 else 0
-                        events = self._load_events_batch(h5_file, start_idx, end_idx)
 
         except Exception as e:
-            logger.error(f"Error loading {h5_file}: {e}")
+            logger.error(f"Error determining event window for {h5_file}: {e}")
             traceback.print_exc()
-            events = torch.zeros((0, 4), dtype=torch.float32)
-            if self.force_cpu:
-                events = events.cpu()
+            start_idx = 0
+            end_idx = 0
 
-        # Load corresponding annotations with temporal matching
-        targets = self._load_annotations_for_events(h5_file, events)
-
-        # Rasterize events into spike frames [T,H,W] (signed, single channel)
-        frames = self._events_to_frames(events)
+        # STREAMING: Process events directly from HDF5 in chunks and accumulate frames
+        # This avoids loading all events (3-4M+) into memory at once
+        # The function streams events in 100K chunks, processes them, and deletes immediately
+        # CRITICAL: Always use _events_to_frames_streaming, never _events_to_frames or _load_events_batch
+        # to prevent CUDA OOM errors
+        if self.debug_sample_loading:
+            logger.debug(f"Using streaming method for {h5_file.name} (events {start_idx}-{end_idx})")
+        frames, event_timestamps = self._events_to_frames_streaming(h5_file, start_idx, end_idx)
+        
+        # Load corresponding annotations with temporal matching (uses event_timestamps)
+        targets = self._load_annotations_for_events(h5_file, event_timestamps)
+        
+        # Force garbage collection to free any remaining memory
+        import gc
+        gc.collect()
+        
+        # Explicitly clear CUDA cache after loading sample to prevent memory accumulation
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
         if self.force_cpu:
             frames = frames.cpu()
 
-        # Extract event timestamps for temporal-aware matching
-        event_timestamps = events[:, 2] if len(events) > 0 else torch.zeros(0, dtype=torch.float32)
-        if self.force_cpu and len(event_timestamps) == 0:
-            event_timestamps = event_timestamps.cpu()
-
-        # Cache if needed
+        # Cache if needed (frames only - events removed to save memory)
         if self.cache_samples and self._sample_cache is not None:
             self._sample_cache[cache_key] = {
-                "events": events.clone(),
                 "frames": frames.clone(),
                 "targets": targets.clone(),
                 "event_timestamps": event_timestamps.clone(),
                 "filename": h5_file.name,
             }
 
+        # Return only frames (model input) - raw events removed to save memory
+        # Frames are [T,H,W] which is what the model expects
+        # Raw events are no longer returned since they're not used by the model
         return {
-            "events": events,
-            "frames": frames,            # NEW: [T,H,W] signed spike frames
+            "frames": frames,            # [T,H,W] signed spike frames - USED BY MODEL
             "targets": targets,
             "event_timestamps": event_timestamps,
             "filename": h5_file.name,
@@ -1272,27 +1740,83 @@ class UltraLowMemoryLoader(Dataset):
         }
 
     def _get_event_indices(self, events_group, sample_idx, total_events):
-        """Get event indices using sliding window approach (for non-targeted training)"""
-        if total_events <= self.max_events_per_sample:
-            return np.arange(total_events)
+        """Get event indices using time-based sliding window approach (for non-targeted training)
+        
+        Uses time windows instead of event count limits to handle unlimited events per window.
+        """
+        # Use time-based windows instead of event count limits
+        # Calculate time window size in microseconds
+        time_window_us = self.time_window_us
+        
+        # Get timestamps to calculate time-based windows
+        if total_events == 0:
+            return np.arange(0)
+        
+        # Read timestamps in chunks to avoid loading all at once
+        chunk_size = 100000
+        if total_events <= chunk_size:
+            timestamps = events_group["t"][:]
+            t_min = float(timestamps[0])
+            t_max = float(timestamps[-1])
         else:
-            overlap = self.max_events_per_sample // 4  # 25% overlap
-            step_size = self.max_events_per_sample - overlap
-
-            start_idx = sample_idx * step_size
-            end_idx = min(start_idx + self.max_events_per_sample, total_events)
-
-            if end_idx - start_idx < self.max_events_per_sample // 2:
-                start_idx = max(0, total_events - self.max_events_per_sample)
-                end_idx = total_events
-
-            return np.arange(start_idx, end_idx)
+            # Sample timestamps to estimate range
+            sample_indices = np.linspace(0, total_events - 1, min(1000, total_events), dtype=int)
+            sample_times = events_group["t"][sample_indices]
+            t_min = float(sample_times.min())
+            t_max = float(sample_times.max())
+        
+        total_duration = t_max - t_min
+        if total_duration <= 0:
+            # All events at same time - return all
+            return np.arange(total_events)
+        
+        # Calculate number of time windows
+        num_windows = max(1, int(total_duration / time_window_us))
+        
+        # Calculate which window this sample belongs to
+        window_idx = sample_idx % num_windows
+        window_start_time = t_min + window_idx * time_window_us
+        window_end_time = min(t_max, window_start_time + time_window_us)
+        
+        # Binary search to find events in this time window
+        # Find start index
+        left, right = 0, total_events - 1
+        while right - left > 1:
+            mid = (left + right) // 2
+            mid_time = float(events_group["t"][mid])
+            if mid_time < window_start_time:
+                left = mid + 1
+            else:
+                right = mid
+        start_idx = left
+        
+        # Find end index
+        left, right = start_idx, total_events - 1
+        while right - left > 1:
+            mid = (left + right) // 2
+            mid_time = float(events_group["t"][mid])
+            if mid_time <= window_end_time:
+                left = mid + 1
+            else:
+                right = mid
+        end_idx = right
+        
+        # Ensure we have at least some events
+        if end_idx <= start_idx:
+            # Fallback: use a small window
+            start_idx = max(0, sample_idx * 10000)
+            end_idx = min(total_events, start_idx + 10000)
+        
+        return np.arange(start_idx, end_idx)
 
 def custom_collate_fn(batch, force_cpu=False):
-    """Custom collate function to handle variable-sized event tensors"""
-    events = [item["events"] for item in batch]
+    """Custom collate function to handle frames and targets.
+    
+    NOTE: Raw events are no longer included in the batch to save memory.
+    Only frames [T,H,W] are returned, which is what the model uses.
+    """
     targets = [item["targets"] for item in batch]
-    event_timestamps = [item["event_timestamps"] for item in batch]  # NEW
+    event_timestamps = [item["event_timestamps"] for item in batch]
     filenames = [item["filename"] for item in batch]
     sample_indices = [item["sample_idx"] for item in batch]
     frames_list = [item.get("frames") for item in batch]
@@ -1300,37 +1824,8 @@ def custom_collate_fn(batch, force_cpu=False):
     # CRITICAL: Force all input tensors to CPU ONLY if force_cpu is True
     # Worker processes might create tensors on CUDA even with pin_memory=False
     if force_cpu:
-        events = [e.cpu() if e.is_cuda else e for e in events]
         targets = [t.cpu() if t.is_cuda else t for t in targets]
         event_timestamps = [ts.cpu() if ts.is_cuda else ts for ts in event_timestamps]
-
-    # Pad events to the same length
-    if len(events) == 0:
-        max_length = 0
-    else:
-        max_length = max(event.shape[0] for event in events)
-
-    padded_events = []
-
-    for event in events:
-        # Ensure event is on CPU if force_cpu
-        if force_cpu:
-            event = event.cpu()
-        if event.shape[0] < max_length:
-            # Pad with zeros - explicitly use CPU device if force_cpu
-            device = 'cpu' if force_cpu else event.device
-            padding = torch.zeros((max_length - event.shape[0], event.shape[1]), dtype=event.dtype, device=device)
-            padded_event = torch.cat([event, padding], dim=0)
-            if force_cpu:
-                padded_event = padded_event.cpu()
-        else:
-            padded_event = event.cpu() if force_cpu else event
-        padded_events.append(padded_event)
-
-    # Stack padded events - ensure result is on CPU if force_cpu
-    events_tensor = torch.stack(padded_events, dim=0)
-    if force_cpu:
-        events_tensor = events_tensor.cpu()
 
     # Handle targets with different sizes (some samples may have 0 annotations)
     if len(targets) == 0:
@@ -1376,6 +1871,12 @@ def custom_collate_fn(batch, force_cpu=False):
             frames_tensor = torch.stack(frames_list_proc, dim=0)  # [B,T,H,W]
 
     # Pad event timestamps to same length for the batch
+    # Get max length from event_timestamps (they correspond to the original events)
+    if len(event_timestamps) == 0:
+        max_length = 0
+    else:
+        max_length = max(ts.shape[0] for ts in event_timestamps)
+    
     padded_timestamps = []
     for ts in event_timestamps:
         # Ensure ts is on CPU if force_cpu
@@ -1397,10 +1898,9 @@ def custom_collate_fn(batch, force_cpu=False):
         event_timestamps_tensor = event_timestamps_tensor.cpu()
 
     return {
-        "events": events_tensor,
-        "frames": frames_tensor,                 # NEW
+        "frames": frames_tensor,                 # [B, T, H, W] - model input
         "targets": targets_tensor,
-        "event_timestamps": event_timestamps_tensor,  # NEW: Event timestamps
+        "event_timestamps": event_timestamps_tensor,  # Event timestamps for temporal matching
         "filenames": filenames,
         "sample_indices": sample_indices
     }
