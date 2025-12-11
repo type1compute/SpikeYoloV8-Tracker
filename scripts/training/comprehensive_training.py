@@ -11,6 +11,8 @@ import logging
 import json
 import argparse
 import warnings
+import signal
+import atexit
 from datetime import datetime
 from typing import Optional
 import traceback
@@ -261,6 +263,16 @@ def create_model(config: Config, device: torch.device):
     # Prepare model for Quantization-Aware Training (QAT) if enabled
     model = prepare_model_for_qat(model, config, device)
 
+    # Enable gradient checkpointing if configured (trades compute for memory)
+    use_gradient_checkpointing = config.get('training.use_gradient_checkpointing', False)
+    if use_gradient_checkpointing and device.type == 'cuda':
+        logger.info("Enabling gradient checkpointing to reduce memory usage (slower but uses less memory)...")
+        if hasattr(model, 'enable_gradient_checkpointing'):
+            model.enable_gradient_checkpointing()
+            logger.info("Gradient checkpointing enabled on model")
+        else:
+            logger.warning("Model does not support gradient checkpointing. Skipping.")
+
     # Convert model to FP16 if enabled (direct FP16, not AMP)
     use_fp16 = config.get('training.use_fp16', False)
     if use_fp16 and device.type == 'cuda':
@@ -278,12 +290,20 @@ def create_model(config: Config, device: torch.device):
     param_dtype = next(model.parameters()).dtype
     bytes_per_param = 2 if param_dtype == torch.float16 else 4
     model_size_mb = total_params * bytes_per_param / 1024 / 1024
+    
+    # Calculate actual GPU memory usage for model
+    total_model_gpu_mb = 0.0
+    if device.type == 'cuda':
+        model_gpu_memory = sum(p.numel() * p.element_size() for p in model.parameters() if p.is_cuda) / 1024**2
+        model_buffers_memory = sum(b.numel() * b.element_size() for b in model.buffers() if b.is_cuda) / 1024**2
+        total_model_gpu_mb = model_gpu_memory + model_buffers_memory
+        logger.info(f"Model GPU memory usage: {total_model_gpu_mb:.2f} MB ({total_model_gpu_mb/1024:.2f} GB)")
 
     logger.info(f"Model created successfully:")
     logger.info(f"  Total parameters: {total_params:,}")
     logger.info(f"  Trainable parameters: {trainable_params:,}")
     logger.info(f"  Model dtype: {param_dtype}")
-    logger.info(f"  Model size: {model_size_mb:.2f} MB")
+    logger.info(f"  Model size (theoretical): {model_size_mb:.2f} MB ({model_size_mb/1024:.2f} GB)")
 
     return model
 
@@ -391,9 +411,16 @@ def train_epoch(model, train_loader, optimizer, loss_fn, device, epoch, config, 
 
     logger.info(f"Starting epoch {epoch}")
     logger.info(f"Gradient accumulation: {accumulation_steps} steps (effective batch size: {effective_batch_size})")
+    
+    # Log initial GPU memory if available
+    if device.type == 'cuda':
+        torch.cuda.reset_peak_memory_stats()
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        logger.info(f"Initial GPU memory: {allocated:.2f} GB allocated, {reserved:.2f} GB reserved")
 
     # Zero gradients at the start of epoch
-    optimizer.zero_grad()
+    optimizer.zero_grad(set_to_none=True)  # Use set_to_none for better memory management
 
     # Profiling metrics
     total_data_time = 0.0
@@ -403,6 +430,10 @@ def train_epoch(model, train_loader, optimizer, loss_fn, device, epoch, config, 
     batch_start_time = time.time()
 
     for batch_idx, batch in enumerate(train_loader):
+        # CRITICAL: Clear CUDA cache at the start of each batch to prevent fragmentation
+        if device.type == 'cuda' and batch_idx > 0:
+            torch.cuda.empty_cache()
+        
         # Measure data loading time
         data_time = time.time() - batch_start_time
         total_data_time += data_time
@@ -413,16 +444,20 @@ def train_epoch(model, train_loader, optimizer, loss_fn, device, epoch, config, 
             if 'frames' not in batch or batch['frames'] is None:
                 raise ValueError("Frames not found in batch. This should not happen - frames are required for model input.")
             
+            # CRITICAL: Data is preloaded on CPU and moved to GPU batch-by-batch
+            # This allows reusing the same CPU data for every epoch
             # Use pre-computed frames (memory efficient)
             if device.type == 'cpu':
                 events = batch['frames'].cpu().to(device)  # frames are [B, T, H, W]
             else:
-                events = batch['frames'].to(device)
+                # Move from CPU (preloaded) to GPU for this batch
+                events = batch['frames'].to(device)  # Data is on CPU, moved to GPU here
             
             if device.type == 'cpu':
                 targets = batch['targets'].cpu().to(device)  # Move targets to device first
             else:
-                targets = batch['targets'].to(device)  # Move targets to device first
+                # Move from CPU (preloaded) to GPU for this batch
+                targets = batch['targets'].to(device)  # Data is on CPU, moved to GPU here
 
             # Convert inputs to FP16 if model is FP16 (direct FP16 training)
             use_fp16 = config.get('training.use_fp16', False)
@@ -455,8 +490,16 @@ def train_epoch(model, train_loader, optimizer, loss_fn, device, epoch, config, 
             loss = None  # Initialize loss to None
             loss_dict = None
             try:
+                # CRITICAL: Clear any cached activations before forward pass
+                if device.type == 'cuda':
+                    torch.cuda.empty_cache()
+                
                 with torch.amp.autocast('cuda', enabled=use_amp_this_batch):
                     outputs = model(events)
+                    
+                # CRITICAL: Synchronize CUDA operations before deleting tensors
+                if device.type == 'cuda':
+                    torch.cuda.synchronize()
 
                 if isinstance(outputs, tuple):
                     predictions, track_features = outputs
@@ -484,6 +527,21 @@ def train_epoch(model, train_loader, optimizer, loss_fn, device, epoch, config, 
 
                 # Normalize loss by accumulation steps (to simulate larger batch size)
                 loss = loss / accumulation_steps
+                
+                # CRITICAL: Delete intermediate tensors immediately after loss computation to free GPU memory
+                # These tensors are no longer needed after loss computation
+                try:
+                    del outputs  # Delete outputs immediately after extracting predictions/track_features
+                    del predictions  # Delete predictions - loss computation is done
+                    if track_features is not None:
+                        del track_features  # Delete track_features - loss computation is done
+                except NameError:
+                    pass
+                
+                # CRITICAL: Force CUDA cache clear after deleting large tensors
+                if device.type == 'cuda':
+                    torch.cuda.synchronize()  # Ensure deletions complete
+                    torch.cuda.empty_cache()  # Free memory immediately
             except Exception as forward_error:
                 # If forward pass or loss computation failed, skip this batch
                 logger.error(f"Error in forward pass or loss computation at batch {batch_idx}: {forward_error}")
@@ -531,6 +589,8 @@ def train_epoch(model, train_loader, optimizer, loss_fn, device, epoch, config, 
 
             # Backward pass (accumulate gradients) with optional AMP scaling
             backward_start = time.time()
+            # Extract loss value before backward pass (needed for statistics)
+            loss_value = loss.item()
             if use_amp_this_batch:
                 scaler.scale(loss).backward()
             else:
@@ -538,8 +598,25 @@ def train_epoch(model, train_loader, optimizer, loss_fn, device, epoch, config, 
             backward_time = time.time() - backward_start
             total_backward_time += backward_time
 
+            # CRITICAL: Delete loss tensor immediately after backward pass to free GPU memory
+            # The loss computation graph is no longer needed after backward()
+            try:
+                del loss
+                # Also delete loss_dict if not needed for logging
+                # We'll extract values needed for logging before deletion
+                if batch_idx % config.get('logging.print_every', 50) != 0:
+                    # Not logging this batch - can delete loss_dict immediately
+                    del loss_dict
+            except NameError:
+                pass
+            
+            # CRITICAL: Synchronize and clear cache after backward pass
+            if device.type == 'cuda':
+                torch.cuda.synchronize()  # Ensure backward pass completes
+                torch.cuda.empty_cache()  # Free memory from backward pass
+
             # Update statistics (multiply by accumulation_steps to account for normalization)
-            total_loss += loss.item() * accumulation_steps
+            total_loss += loss_value * accumulation_steps
             total_samples += len(events)
 
             # Perform optimizer step every accumulation_steps batches
@@ -585,17 +662,22 @@ def train_epoch(model, train_loader, optimizer, loss_fn, device, epoch, config, 
 
                 num_optim_steps += 1
 
-                optimizer.zero_grad()  # Zero gradients for next accumulation cycle
+                optimizer.zero_grad(set_to_none=True)  # Zero gradients and set to None to free memory immediately
                 optimizer_time = time.time() - optimizer_start
                 total_optimizer_time += optimizer_time
                 
                 # CRITICAL: Clear CUDA cache after optimizer step to free memory
                 # This helps prevent memory fragmentation
-                if device.type == 'cuda' and batch_idx % 5 == 0:  # Every 5 optimizer steps
-                    torch.cuda.empty_cache()
+                if device.type == 'cuda':
+                    torch.cuda.synchronize()  # Ensure optimizer step completes
+                    torch.cuda.empty_cache()  # Free memory immediately
+                    # Also run garbage collection after optimizer step to free Python objects
+                    import gc
+                    gc.collect()
+                    torch.cuda.empty_cache()  # Clear again after GC
 
             # Log progress (only if loss was successfully computed)
-            if batch_idx % config.get('logging.print_every', 50) == 0 and 'loss' in locals() and 'loss_dict' in locals():
+            if batch_idx % config.get('logging.print_every', 50) == 0 and 'loss_dict' in locals():
                 # Get unique filenames in this batch
                 filenames = batch.get('filenames', ['unknown'])
                 unique_files = list(set(filenames))
@@ -604,7 +686,7 @@ def train_epoch(model, train_loader, optimizer, loss_fn, device, epoch, config, 
                     files_str += f" (+{len(unique_files)-3} more)"
 
                 # Display unnormalized loss for logging (multiply by accumulation_steps)
-                unnormalized_loss = loss.item() * accumulation_steps
+                unnormalized_loss = loss_value * accumulation_steps
                 # Get detailed tracking loss breakdown if available
                 track_loss = loss_dict.get('track_loss', 0)
                 track_loss_details = getattr(loss_fn, '_last_track_loss_details', None)
@@ -631,24 +713,25 @@ def train_epoch(model, train_loader, optimizer, loss_fn, device, epoch, config, 
                 root_logger = logging.getLogger()
                 if hasattr(root_logger, '_file_handler'):
                     root_logger._file_handler.flush()
+                
+                # Delete loss_dict after logging
+                try:
+                    del loss_dict
+                except NameError:
+                    pass
 
             # CRITICAL: Explicitly delete batch tensors to free memory immediately
             # This prevents CUDA memory accumulation across batches
+            # Note: outputs, predictions, track_features, and loss are already deleted above
             try:
                 del events, targets, targets_list
             except NameError:
                 pass
             try:
-                if 'outputs' in locals():
-                    del outputs
-                if 'predictions' in locals():
-                    del predictions
-                if 'track_features' in locals():
-                    del track_features
-                if 'loss_dict' in locals():
-                    del loss_dict
                 if 'event_timestamps' in locals():
                     del event_timestamps
+                if 'loss_dict' in locals():
+                    del loss_dict
             except NameError:
                 pass
             # Delete the entire batch dictionary to free all references
@@ -657,13 +740,13 @@ def train_epoch(model, train_loader, optimizer, loss_fn, device, epoch, config, 
             except NameError:
                 pass
             
-            # Force garbage collection every N batches to free memory
-            if batch_idx % 10 == 0:  # Every 10 batches
-                import gc
-                gc.collect()
-                # Clear CUDA cache periodically to prevent fragmentation
-                if device.type == 'cuda':
-                    torch.cuda.empty_cache()
+            # CRITICAL: Force garbage collection and cache clearing after every batch
+            # This is more aggressive but necessary to prevent OOM
+            import gc
+            gc.collect()
+            if device.type == 'cuda':
+                torch.cuda.synchronize()  # Ensure all operations complete
+                torch.cuda.empty_cache()  # Free memory immediately after each batch
 
             # Reset timer for next batch (measure data loading time)
             batch_start_time = time.time()
@@ -717,9 +800,26 @@ def train_epoch(model, train_loader, optimizer, loss_fn, device, epoch, config, 
             scheduler.step()
 
         num_optim_steps += 1
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)  # Zero gradients and set to None to free memory
+        
+        # Clear CUDA cache after final optimizer step
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
+            import gc
+            gc.collect()
 
     avg_loss = total_loss / len(train_loader) if len(train_loader) > 0 else 0
+
+    # Log final GPU memory if available
+    if device.type == 'cuda':
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        peak_allocated = torch.cuda.max_memory_allocated() / 1024**3
+        peak_reserved = torch.cuda.max_memory_reserved() / 1024**3
+        logger.info(f"Final GPU memory: {allocated:.2f} GB allocated, {reserved:.2f} GB reserved")
+        logger.info(f"Peak GPU memory: {peak_allocated:.2f} GB allocated, {peak_reserved:.2f} GB reserved")
+        # Reset peak stats for next epoch
+        torch.cuda.reset_peak_memory_stats()
 
     # Print profiling summary
     total_time = total_data_time + total_forward_time + total_backward_time + total_optimizer_time
@@ -782,6 +882,10 @@ def validate_epoch(model, val_loader, loss_fn, device, epoch, config):
     # This ensures no backpropagation or parameter updates occur
     with torch.no_grad():
         for batch_idx, batch in enumerate(val_loader):
+            # CRITICAL: Clear CUDA cache at the start of each validation batch
+            if device.type == 'cuda' and batch_idx > 0:
+                torch.cuda.empty_cache()
+            
             try:
                 logger.info(f"Validation batch {batch_idx}: Starting processing...")
 
@@ -960,14 +1064,44 @@ def validate_epoch(model, val_loader, loss_fn, device, epoch, config):
                         logger.warning(f"WARNING: Loss tensor requires gradient! This should not happen in validation.")
                         # Force detach to prevent any accidental backpropagation
                         loss = loss.detach()
+                    
+                    # CRITICAL: Delete intermediate tensors immediately after loss computation to free GPU memory
+                    # These tensors are no longer needed after loss computation in validation
+                    try:
+                        del outputs  # Delete outputs immediately after extracting predictions/track_features
+                        del predictions  # Delete predictions - loss computation is done
+                        if track_features is not None:
+                            del track_features  # Delete track_features - loss computation is done
+                    except NameError:
+                        pass
+                    
+                    # CRITICAL: Force CUDA cache clear after deleting large tensors in validation
+                    if device.type == 'cuda':
+                        torch.cuda.synchronize()  # Ensure deletions complete
+                        torch.cuda.empty_cache()  # Free memory immediately
                 except Exception as e:
                     logger.error(f"Error computing loss at batch {batch_idx}: {e}")
                     logger.error(f"Loss computation traceback: {traceback.format_exc()}")
+                    # Clean up on error
+                    try:
+                        if 'outputs' in locals():
+                            del outputs
+                        if 'predictions' in locals():
+                            del predictions
+                        if 'track_features' in locals() and track_features is not None:
+                            del track_features
+                    except NameError:
+                        pass
                     continue
 
                 # Check for NaN losses
                 if torch.isnan(loss):
                     logger.warning(f"NaN loss detected in validation batch {batch_idx}, skipping...")
+                    # Clean up before continuing
+                    try:
+                        del loss, loss_dict
+                    except NameError:
+                        pass
                     continue
 
                 # Check for model parameter corruption after loss computation
@@ -980,8 +1114,9 @@ def validate_epoch(model, val_loader, loss_fn, device, epoch, config):
                             logger.error(f"Inf detected in model parameter {name} after batch {batch_idx}")
                             return None
 
-                # Update statistics
-                total_loss += loss.item()
+                # Update statistics (extract loss value before deletion)
+                loss_value = loss.item()
+                total_loss += loss_value
                 total_samples += len(events)
 
                 # Log progress
@@ -995,17 +1130,66 @@ def validate_epoch(model, val_loader, loss_fn, device, epoch, config):
 
                     logger.info(
                         f"Val Epoch {epoch}, Batch {batch_idx}/{len(val_loader)}: "
-                        f"Total Loss = {loss.item():.6f}, "
+                        f"Total Loss = {loss_value:.6f}, "
                         f"Box Loss = {loss_dict.get('box_loss', 0):.6f}, "
                         f"Class Loss = {loss_dict.get('cls_loss', 0):.6f}, "
                         f"Track Loss = {loss_dict.get('track_loss', 0):.6f} | "
                         f"Files: {files_str}"
                     )
 
+                # CRITICAL: Delete loss tensors immediately after use to free GPU memory
+                try:
+                    del loss
+                    del loss_dict
+                except NameError:
+                    pass
+                
+                # CRITICAL: Delete batch tensors to free memory immediately
+                try:
+                    del events, targets, targets_list
+                    if 'event_timestamps' in locals():
+                        del event_timestamps
+                    del batch
+                except NameError:
+                    pass
+                
+                # Force garbage collection periodically in validation
+                if batch_idx % 10 == 0:  # Every 10 batches
+                    import gc
+                    gc.collect()
+                    if device.type == 'cuda':
+                        torch.cuda.empty_cache()
+
             except Exception as e:
                 logger.error(f"Error in validation batch {batch_idx}: {e}")
                 logger.error(f"Batch contents: {batch.keys() if 'batch' in locals() else 'Batch not available'}")
                 logger.error(f"Full traceback: {traceback.format_exc()}")
+                # CRITICAL: Clean up on error
+                try:
+                    if 'events' in locals():
+                        del events
+                    if 'targets' in locals():
+                        del targets
+                    if 'targets_list' in locals():
+                        del targets_list
+                    if 'outputs' in locals():
+                        del outputs
+                    if 'predictions' in locals():
+                        del predictions
+                    if 'track_features' in locals() and track_features is not None:
+                        del track_features
+                    if 'loss' in locals():
+                        del loss
+                    if 'loss_dict' in locals():
+                        del loss_dict
+                    if 'batch' in locals():
+                        del batch
+                except NameError:
+                    pass
+                import gc
+                gc.collect()
+                if device.type == 'cuda':
+                    torch.cuda.empty_cache()
                 continue
 
 
@@ -1097,8 +1281,170 @@ def save_checkpoint(model, optimizer, scheduler, epoch, train_loss, val_loss,
     
     return checkpoint_path
 
+# Global variables for cleanup
+_cleanup_device = None
+_cleanup_logger = None
+_cleanup_model = None
+_cleanup_optimizer = None
+_cleanup_train_loader = None
+_cleanup_val_loader = None
+
+def cleanup_gpu_memory(device=None, logger=None, model=None, optimizer=None, train_loader=None, val_loader=None):
+    """Cleanup all GPU memory and CUDA context aggressively."""
+    if device is None:
+        device = _cleanup_device
+    if logger is None:
+        logger = _cleanup_logger
+    if model is None:
+        model = _cleanup_model
+    if optimizer is None:
+        optimizer = _cleanup_optimizer
+    if train_loader is None:
+        train_loader = _cleanup_train_loader
+    if val_loader is None:
+        val_loader = _cleanup_val_loader
+        
+    try:
+        if logger:
+            logger.info("="*80)
+            logger.info("AGGRESSIVE GPU MEMORY CLEANUP")
+            logger.info("="*80)
+        
+        # Step 1: Clear data loader caches (these can hold large amounts of CPU/GPU memory)
+        if train_loader is not None:
+            try:
+                if hasattr(train_loader, 'dataset') and hasattr(train_loader.dataset, '_sample_cache'):
+                    if logger:
+                        logger.info("Clearing training data loader cache...")
+                    train_loader.dataset._sample_cache = None
+                    train_loader.dataset._annotation_cache = {}
+                    train_loader.dataset._event_indices_cache = {}
+            except Exception as e:
+                if logger:
+                    logger.warning(f"Error clearing train loader cache: {e}")
+        
+        if val_loader is not None:
+            try:
+                if hasattr(val_loader, 'dataset') and hasattr(val_loader.dataset, '_sample_cache'):
+                    if logger:
+                        logger.info("Clearing validation data loader cache...")
+                    val_loader.dataset._sample_cache = None
+                    val_loader.dataset._annotation_cache = {}
+                    val_loader.dataset._event_indices_cache = {}
+            except Exception as e:
+                if logger:
+                    logger.warning(f"Error clearing val loader cache: {e}")
+        
+        # Step 2: Delete data loaders
+        if train_loader is not None:
+            try:
+                del train_loader
+            except Exception as e:
+                if logger:
+                    logger.warning(f"Error deleting train_loader: {e}")
+        
+        if val_loader is not None:
+            try:
+                del val_loader
+            except Exception as e:
+                if logger:
+                    logger.warning(f"Error deleting val_loader: {e}")
+        
+        # Step 3: Delete model and optimizer explicitly
+        if model is not None:
+            try:
+                if logger:
+                    logger.info("Moving model to CPU and deleting...")
+                # Move model to CPU first to free GPU memory
+                model = model.cpu()
+                # Clear any cached states
+                if hasattr(model, 'eval'):
+                    model.eval()  # Set to eval mode to disable gradients
+                del model
+            except Exception as e:
+                if logger:
+                    logger.warning(f"Error deleting model: {e}")
+        
+        if optimizer is not None:
+            try:
+                if logger:
+                    logger.info("Deleting optimizer...")
+                # Clear optimizer state
+                optimizer.state = {}
+                del optimizer
+            except Exception as e:
+                if logger:
+                    logger.warning(f"Error deleting optimizer: {e}")
+        
+        # Step 4: Force garbage collection multiple times
+        import gc
+        if logger:
+            logger.info("Running garbage collection...")
+        for i in range(5):  # More aggressive - 5 rounds
+            gc.collect()
+        
+        # Step 5: Clear CUDA cache aggressively
+        if device is not None and device.type == 'cuda':
+            if logger:
+                logger.info("Clearing CUDA cache...")
+            # Clear CUDA cache multiple times to handle fragmentation
+            for i in range(5):  # More aggressive - 5 rounds
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+                gc.collect()
+            
+            # Reset CUDA memory stats
+            try:
+                torch.cuda.reset_peak_memory_stats()
+                torch.cuda.reset_accumulated_memory_stats()
+            except Exception:
+                pass  # Some CUDA versions don't have reset_accumulated_memory_stats
+            
+            # Get final memory stats
+            allocated = torch.cuda.memory_allocated() / 1024**3
+            reserved = torch.cuda.memory_reserved() / 1024**3
+            if logger:
+                logger.info(f"GPU memory after cleanup: {allocated:.2f} GB allocated, {reserved:.2f} GB reserved")
+                if allocated > 1.0 or reserved > 1.0:
+                    logger.warning("="*80)
+                    logger.warning(f"WARNING: GPU memory still allocated ({allocated:.2f} GB allocated, {reserved:.2f} GB reserved)")
+                    logger.warning("This may indicate:")
+                    logger.warning("  - CUDA context not fully released (normal if process is still running)")
+                    logger.warning("  - Memory fragmentation")
+                    logger.warning("  - Other processes using GPU")
+                    logger.warning("  - CUDA driver caching")
+                    logger.warning("")
+                    logger.warning("NOTE: If process was killed (SIGKILL), cleanup handlers cannot run.")
+                    logger.warning("      GPU memory will be released when Python process fully exits.")
+                    logger.warning("      Check with: nvidia-smi")
+                    logger.warning("="*80)
+        
+        # Step 6: Final garbage collection
+        gc.collect()
+        
+        if logger:
+            logger.info("GPU memory cleanup completed")
+            logger.info("="*80)
+    except Exception as e:
+        if logger:
+            logger.warning(f"Error during GPU cleanup: {e}")
+            import traceback
+            logger.warning(f"Traceback: {traceback.format_exc()}")
+
+def signal_handler(signum, frame):
+    """Handle interrupt signals (Ctrl+C, SIGTERM) gracefully."""
+    if _cleanup_logger:
+        _cleanup_logger.warning(f"Received signal {signum}. Cleaning up and exiting...")
+    cleanup_gpu_memory(
+        train_loader=_cleanup_train_loader,
+        val_loader=_cleanup_val_loader
+    )
+    sys.exit(0)
+
 def main():
     """Main training function."""
+    global _cleanup_device, _cleanup_logger, _cleanup_model, _cleanup_optimizer, _cleanup_train_loader, _cleanup_val_loader
+    
     # Load configuration first to get default values
     config = Config('config/config.yaml')
     
@@ -1125,6 +1471,9 @@ def main():
     log_file_name = config.get('model.log_file_name', None)
     log_format = config.get('logging.format', None)
     logger, log_file = setup_logging(config.get_logs_dir(), args.log_level, log_file_name=log_file_name, log_format=log_format)
+    
+    # Store logger for cleanup handlers
+    _cleanup_logger = logger
     
     logger.info("="*80)
     logger.info("TRAFFIC_MONITORING SPIKEYOLO COMPREHENSIVE TRAINING")
@@ -1168,11 +1517,20 @@ def main():
     if device.type == 'cuda':
         logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
         logger.info(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+        # Store device for cleanup handlers
+        _cleanup_device = device
+        # Register signal handlers for graceful shutdown
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+        # Register atexit handler for cleanup on normal exit
+        atexit.register(cleanup_gpu_memory)
+        logger.info("Registered cleanup handlers for graceful shutdown")
     elif device.type == 'cpu' and not force_cpu:
         logger.warning("Running on CPU - this may be slow. Set device.force_cpu=true in config/config.yaml to explicitly force CPU, or use --device cuda to use GPU if available.")
     
     # Create model
     model = create_model(config, device)
+    _cleanup_model = model  # Store for cleanup
     
     # Create data loaders first (needed for OneCycleLR steps_per_epoch calculation)
     logger.info("Creating data loaders...")
@@ -1197,6 +1555,23 @@ def main():
         if config.get('data_processing.use_class_balanced_sampling', False):
             logger.info(f"Using max_samples_per_file={config.get('data_processing.max_samples_per_file', None)} as fallback (per-file limit)")
     
+    # CRITICAL: Enable preloading and caching for training data
+    # This loads all data once on CPU and reuses it for every epoch
+    # Data is moved to GPU batch-by-batch during training
+    cache_samples = config.get('data_processing.cache_samples', True)  # Default to True for preloading
+    preload_all_samples = config.get('data_processing.preload_all_samples', True)  # Default to True for preloading
+    
+    if preload_all_samples and not cache_samples:
+        logger.warning("preload_all_samples=True requires cache_samples=True. Enabling cache_samples automatically.")
+        cache_samples = True
+    
+    if preload_all_samples:
+        logger.info("="*80)
+        logger.info("PRELOADING ENABLED: All training data will be loaded once on CPU")
+        logger.info("Data will be reused for every epoch, moved to GPU batch-by-batch")
+        logger.info("This reduces I/O overhead and speeds up training significantly")
+        logger.info("="*80)
+    
     train_loader = create_dataloader(
         data_root=config.get_data_root(),
         split='train',
@@ -1212,8 +1587,8 @@ def main():
         use_class_balanced_sampling=config.get('data_processing.use_class_balanced_sampling', False),  # Pass class balancing flag
         min_samples_per_class=config.get('data_processing.min_samples_per_class', 1),  # Pass minimum samples per class
         max_annotations_per_class=max_annotations_per_class,  # Pass annotation limit per class
-        cache_samples=config.get('data_processing.cache_samples', False),
-        preload_all_samples=config.get('data_processing.preload_all_samples', False),  # Pass preloading flag
+        cache_samples=cache_samples,  # Use enabled cache_samples
+        preload_all_samples=preload_all_samples,  # Use enabled preload_all_samples
         debug_sample_loading=config.get('data_processing.debug_sample_loading', False),
         time_steps=config.get_time_steps(),
         image_height=config.get('data_processing.image_height', 720),
@@ -1221,13 +1596,25 @@ def main():
         config=config,  # Pass config for DataLoader parameters
         time_window_us=config.get_window_us()
     )
+    _cleanup_train_loader = train_loader  # Store for cleanup
+    
+    # Calculate validation sample limit based on training samples and validation_annotation_ratio
+    # This ensures validation uses approximately the configured percentage of training samples
+    train_total_samples = len(train_loader.dataset)
+    validation_ratio = config.get('data_processing.validation_annotation_ratio', 0.2)
+    val_max_total_samples = int(train_total_samples * validation_ratio)
+    logger.info(f"Training dataset has {train_total_samples} total samples")
+    logger.info(f"Limiting validation to {val_max_total_samples} samples ({validation_ratio*100:.0f}% of training samples)")
     
     # Validation data loader (drop_last=False to keep incomplete batches for validation)
     # Validation uses the same annotation-based approach as training
-    # Validation annotation limit can be configured via:
+    # Validation limits can be configured via:
     #   1. max_annotations_per_class_validation (fixed number, takes precedence)
-    #   2. validation_annotation_ratio (percentage of training max_annotations_per_class)
+    #   2. validation_annotation_ratio (controls both total samples and annotations per class as % of training)
     #   3. validation_min_annotations_per_class (minimum when using ratio)
+    # NOTE: validation_annotation_ratio controls:
+    #   - Total validation samples (limited to ratio * training_samples)
+    #   - Annotations per class (limited to ratio * training_max_annotations_per_class)
     val_max_annotations_per_class = config.get('data_processing.max_annotations_per_class_validation', None)
     
     if val_max_annotations_per_class is None:
@@ -1253,6 +1640,14 @@ def main():
     if config.get('data_processing.use_class_balanced_sampling', False):
         logger.info(f"Validation will use class-balanced sampling with file diversity to ensure spread across files")
     
+    # For validation, also enable preloading if enabled for training
+    # This ensures validation data is also preloaded and reused
+    val_cache_samples = cache_samples  # Use same setting as training
+    val_preload_all_samples = preload_all_samples  # Use same setting as training
+    
+    if val_preload_all_samples:
+        logger.info("PRELOADING ENABLED for validation data as well")
+    
     val_loader = create_dataloader(
         data_root=config.get_data_root(),
         split='val',
@@ -1269,21 +1664,60 @@ def main():
         use_class_balanced_sampling=config.get('data_processing.use_class_balanced_sampling', False),  # Enable class balance + file diversity
         min_samples_per_class=config.get('data_processing.min_samples_per_class', 1),  # Pass minimum samples per class
         max_annotations_per_class=val_max_annotations_per_class,  # Pass annotation limit per class for validation
-        cache_samples=config.get('data_processing.cache_samples', False),
-        preload_all_samples=config.get('data_processing.preload_all_samples', False),  # Pass preloading flag (validation too)
+        cache_samples=val_cache_samples,  # Use same cache setting as training
+        preload_all_samples=val_preload_all_samples,  # Use same preload setting as training
         debug_sample_loading=config.get('data_processing.debug_sample_loading', False),
         time_steps=config.get_time_steps(),
         image_height=config.get('data_processing.image_height', 720),
         config=config,  # Pass config for DataLoader parameters
         image_width=config.get('data_processing.image_width', 1280),
-        time_window_us=config.get_window_us()
+        time_window_us=config.get_window_us(),
+        max_total_samples=val_max_total_samples  # Limit total validation samples to configured percentage of training
     )
+    _cleanup_val_loader = val_loader  # Store for cleanup
     
     logger.info(f"Training batches: {len(train_loader)}")
     logger.info(f"Validation batches: {len(val_loader)}")
     
     # Create optimizer and scheduler (now with train_loader for OneCycleLR)
     optimizer, scheduler = create_optimizer_and_scheduler(model, config, train_loader=train_loader)
+    _cleanup_optimizer = optimizer  # Store for cleanup
+    
+    # Log optimizer state size (can be 2x model size for SGD with momentum)
+    if device.type == 'cuda':
+        # Calculate model GPU memory again (for logging)
+        model_gpu_memory = sum(p.numel() * p.element_size() for p in model.parameters() if p.is_cuda) / 1024**2
+        model_buffers_memory = sum(b.numel() * b.element_size() for b in model.buffers() if b.is_cuda) / 1024**2
+        total_model_gpu_mb = model_gpu_memory + model_buffers_memory
+        
+        optimizer_state_size = 0
+        for param_group in optimizer.param_groups:
+            for p in param_group['params']:
+                if p.is_cuda:
+                    # Parameter itself (already counted in model)
+                    # Optimizer state (momentum, etc.)
+                    state = optimizer.state.get(p, {})
+                    for key, value in state.items():
+                        if isinstance(value, torch.Tensor) and value.is_cuda:
+                            optimizer_state_size += value.numel() * value.element_size()
+        optimizer_state_mb = optimizer_state_size / 1024**2
+        logger.info(f"Optimizer state GPU memory: {optimizer_state_mb:.2f} MB ({optimizer_state_mb/1024:.2f} GB)")
+        
+        # Total GPU memory after model + optimizer
+        total_gpu_mb = total_model_gpu_mb + optimizer_state_mb
+        logger.info(f"Total model + optimizer GPU memory: {total_gpu_mb:.2f} MB ({total_gpu_mb/1024:.2f} GB)")
+        
+        # Check current GPU memory usage
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        logger.info(f"Current GPU memory: {allocated:.2f} GB allocated, {reserved:.2f} GB reserved")
+        if allocated > 10.0:
+            logger.warning(f"WARNING: High GPU memory usage ({allocated:.2f} GB). This may indicate:")
+            logger.warning("  - Large model or optimizer state")
+            logger.warning("  - Memory fragmentation")
+            logger.warning("  - Cached data on GPU (should be on CPU)")
+            logger.warning(f"  - Model+Optimizer should be ~{total_gpu_mb/1024:.2f} GB")
+            logger.warning(f"  - Extra memory: ~{allocated - total_gpu_mb/1024:.2f} GB (may be fragmentation or cached data)")
     
     # Create loss function with config parameters
     loss_config = config.get('yolo_loss', {})
@@ -1838,6 +2272,31 @@ def main():
     
     logger.info(f"Training history saved: {history_file}")
     logger.info(f"Log file: {log_file}")
+    
+    # CRITICAL: Cleanup GPU memory before exit
+    logger.info("Performing final GPU memory cleanup...")
+    cleanup_gpu_memory(train_loader=train_loader, val_loader=val_loader)
+    
+    # Log final GPU memory status
+    if device.type == 'cuda':
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        logger.info(f"Final GPU memory status: {allocated:.2f} GB allocated, {reserved:.2f} GB reserved")
+        if allocated > 0.1 or reserved > 0.1:
+            logger.warning("="*80)
+            logger.warning("WARNING: GPU memory still allocated after cleanup!")
+            logger.warning(f"  Allocated: {allocated:.2f} GB")
+            logger.warning(f"  Reserved: {reserved:.2f} GB")
+            logger.warning("This may be due to:")
+            logger.warning("  1. CUDA context overhead (normal, ~100-500 MB)")
+            logger.warning("  2. Memory fragmentation")
+            logger.warning("  3. Other processes using GPU")
+            logger.warning("  4. Python/CUDA driver caching")
+            logger.warning("To fully release memory, the Python process must exit.")
+            logger.warning("Check with: nvidia-smi")
+            logger.warning("="*80)
 
 if __name__ == "__main__":
+    # Set up signal handlers for graceful shutdown
+    # We'll register them in main() after device is determined
     main()

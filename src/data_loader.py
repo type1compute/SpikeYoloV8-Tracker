@@ -8,6 +8,16 @@ from threading import Thread, Lock
 from typing import Dict, Any, Optional, Tuple, Union
 import time
 import traceback
+import gc
+
+# SpikingJelly for event-to-frame conversion
+try:
+    import spikingjelly.datasets as sjds
+    SPIKINGJELLY_AVAILABLE = True
+except ImportError:
+    SPIKINGJELLY_AVAILABLE = False
+    sjds = None  # Set to None to avoid NameError
+    # Warning will be logged when actually used
 
 # Set up logging - will be configured by calling script
 logger = logging.getLogger(__name__)
@@ -23,7 +33,8 @@ class UltraLowMemoryLoader(Dataset):
                  num_classes: int = 3, use_class_balanced_sampling: bool = False,
                  min_samples_per_class: int = 1, max_annotations_per_class: int = None,
                  cache_samples: bool = False, preload_all_samples: bool = False, debug_sample_loading: bool = False,
-                 time_steps: int = 8, image_height: int = 720, image_width: int = 1280, time_window_us: int = 100000,):
+                 time_steps: int = 8, image_height: int = 720, image_width: int = 1280, time_window_us: int = 100000,
+                 max_total_samples: int = None):
         '''
         Initialize the UltraLowMemoryLoader.
 
@@ -46,6 +57,7 @@ class UltraLowMemoryLoader(Dataset):
             image_height: The height of the image.
             image_width: The width of the image.
             time_window_us: The time window in microseconds.
+            max_total_samples: Maximum total number of samples to use (None = no limit).
         '''
 
         logger.info("=== INITIALIZING ULTRA LOW MEMORY LOADER ===")
@@ -54,6 +66,7 @@ class UltraLowMemoryLoader(Dataset):
         logger.info(f"Max events per sample: {max_events_per_sample}")
         logger.info(f"Max samples per file: {max_samples_per_file}")
         logger.info(f"Max annotations per class: {max_annotations_per_class}")
+        logger.info(f"Max total samples: {max_total_samples}")
         logger.info(f"Targeted training: {targeted_training}")
         logger.info(f"Annotation dir: {annotation_dir}")
         logger.info(f"Number of classes: {num_classes}")
@@ -65,9 +78,13 @@ class UltraLowMemoryLoader(Dataset):
         self.max_annotations_per_class = max_annotations_per_class  # Direct class balance limit
         self.targeted_training = targeted_training
         self.annotation_dir = Path(annotation_dir) if annotation_dir else None
-        self.force_cpu = force_cpu  # Only force CPU tensor creation if explicitly requested
-        # Unified device selection: CUDA if available and not forced to CPU
-        self.device = torch.device('cuda' if torch.cuda.is_available() and not self.force_cpu else 'cpu')
+        # NOTE: force_cpu is kept for compatibility but NOT used for device decisions in data loading.
+        # Data loading is ALWAYS CPU-only to prevent GPU memory usage. The force_cpu config
+        # is for the entire pipeline (model training), not just data loading.
+        self.force_cpu = force_cpu
+        # CRITICAL: Dataset & caching are always CPU-only to avoid GPU memory blow-up. This uses RAM instead.
+        # The training loop will move tensors to GPU later. This is independent of force_cpu config.
+        self.device = torch.device('cpu')
         self.num_classes = int(num_classes)  # Number of classes (dynamically determined from config)
         self.use_class_balanced_sampling = use_class_balanced_sampling  # Enable class-balanced sampling
         self.min_samples_per_class = min_samples_per_class  # Minimum samples per class
@@ -79,6 +96,7 @@ class UltraLowMemoryLoader(Dataset):
         self.image_height = int(image_height)
         self.image_width = int(image_width)
         self.time_window_us = time_window_us
+        self.max_total_samples = max_total_samples
 
         # Add annotation caching to speed up repeated accesses
         self._annotation_cache = {}
@@ -106,7 +124,8 @@ class UltraLowMemoryLoader(Dataset):
             logger.error(error_msg)
             raise ValueError(error_msg)
 
-        logger.info(f"[UltraLowMemoryLoader] Using device: {self.device} (force_cpu={self.force_cpu})")
+        logger.info(f"[UltraLowMemoryLoader] Data loading device: {self.device} (always CPU for data loading/caching)")
+        logger.info(f"[UltraLowMemoryLoader] Note: force_cpu={self.force_cpu} is for entire pipeline, not just data loading")
 
         # Calculate dynamic samples per file based on actual event count
         if self.targeted_training:
@@ -124,6 +143,14 @@ class UltraLowMemoryLoader(Dataset):
         # Create mapping from sample index to file and sample within file
         self.sample_mapping = self._create_sample_mapping()
         self.total_samples = len(self.sample_mapping)
+        
+        # Apply max_total_samples limit if specified
+        if self.max_total_samples is not None and self.total_samples > self.max_total_samples:
+            original_total = self.total_samples
+            # Truncate sample mapping to max_total_samples
+            self.sample_mapping = {idx: self.sample_mapping[idx] for idx in range(min(self.max_total_samples, len(self.sample_mapping)))}
+            self.total_samples = len(self.sample_mapping)
+            logger.info(f"Limited total samples from {original_total} to {self.total_samples} (max_total_samples={self.max_total_samples})")
 
         logger.info(f"Created {self.total_samples} samples with dynamic allocation:")
         for file_path, samples in self.file_samples.items():
@@ -383,7 +410,7 @@ class UltraLowMemoryLoader(Dataset):
             end_time = float(event_timestamps.max())
 
             # Add larger buffer to account for potential timing differences and capture more annotations
-            time_buffer = (end_time - start_time) * 0.2  # 20% buffer (increased from 10% for better annotation capture)
+            time_buffer = (end_time - start_time) * 0.1  # 10% buffer
             start_time -= time_buffer
             end_time += time_buffer
 
@@ -1211,9 +1238,8 @@ class UltraLowMemoryLoader(Dataset):
                 events_group = f["events"]
 
                 if start_idx >= end_idx:
-                    events = torch.zeros((0, 4), dtype=torch.float32)
-                    if self.force_cpu:
-                        events = events.cpu()
+                    # CRITICAL: Always use CPU for data loading
+                    events = torch.zeros((0, 4), dtype=torch.float32, device='cpu')
                     return events
 
                 # OPTIMIZATION 2: Create index array once
@@ -1227,25 +1253,25 @@ class UltraLowMemoryLoader(Dataset):
 
                 # OPTIMIZATION 4: Stack numpy arrays first, then convert to tensor (faster)
                 events_np = np.stack([x, y, t, p], axis=1).astype(np.float32)
-                events = torch.from_numpy(events_np)
-
-                if self.force_cpu:
-                    events = events.cpu()
+                # CRITICAL: Always use CPU for data loading
+                events = torch.from_numpy(events_np).to('cpu')
 
                 return events
 
         except Exception as e:
             logger.error(f"Error loading events from {h5_file}: {e}")
-            events = torch.zeros((0, 4), dtype=torch.float32)
-            if self.force_cpu:
-                events = events.cpu()
+            # CRITICAL: Always use CPU for data loading
+            events = torch.zeros((0, 4), dtype=torch.float32, device='cpu')
             return events
 
     def _events_to_frames_streaming(self, h5_file, start_idx, end_idx):
         """
-        Stream events directly from HDF5 in chunks and accumulate frames incrementally.
+        Stream events directly from HDF5 in chunks and convert to frames using SpikingJelly.
         This avoids loading all events (3-4M+) into memory at once.
         Returns frames [T, H, W] and event_timestamps [N].
+        
+        Uses SpikingJelly's event integration functions for efficient frame conversion.
+        Event polarity is normalized to 0/1 format for SpikingJelly, then converted to signed -1/+1.
         """
         # Determine output geometry
         if not hasattr(self, 'time_steps'):
@@ -1268,7 +1294,7 @@ class UltraLowMemoryLoader(Dataset):
             return frames, event_timestamps
 
         num_events = end_idx - start_idx
-        chunk_size = 100000  # Stream 100K events at a time to minimize memory usage (reduced from 500K)
+        chunk_size = 100000  # Stream 100K events at a time to minimize memory usage
         
         # Initialize min/max timestamps for annotation matching
         t_min_val = None
@@ -1302,131 +1328,127 @@ class UltraLowMemoryLoader(Dataset):
 
                 # Guard against degenerate timestamps
                 if (t_max - t_min) <= 0:
-                    bin_edges = None
-                else:
-                    bin_edges = torch.linspace(t_min, t_max, T + 1, device=device)
+                    # All events at same time - return empty frames
+                    event_timestamps = torch.tensor([t_min_val, t_max_val], dtype=torch.float32, device=device) if t_min_val is not None else torch.zeros(0, dtype=torch.float32, device=device)
+                    return frames, event_timestamps
 
-                # Second pass: Stream events in chunks and accumulate frames
-                if num_events > chunk_size:
-                    num_chunks = (num_events + chunk_size - 1) // chunk_size
-                    logger.debug(f"Streaming {num_events:,} events from HDF5 in {num_chunks} chunks to save memory")
-                    
-                    for chunk_idx in range(num_chunks):
-                        chunk_start = start_idx + chunk_idx * chunk_size
-                        chunk_end = min(start_idx + (chunk_idx + 1) * chunk_size, end_idx)
+                # Calculate time bin edges for T frames
+                time_bin_edges = np.linspace(t_min, t_max, T + 1)
+
+                # Use SpikingJelly if available, otherwise fall back to manual method
+                if SPIKINGJELLY_AVAILABLE:
+                    # Second pass: Stream events in chunks and integrate using SpikingJelly
+                    if num_events > chunk_size:
+                        num_chunks = (num_events + chunk_size - 1) // chunk_size
+                        logger.debug(f"Streaming {num_events:,} events from HDF5 in {num_chunks} chunks using SpikingJelly")
                         
-                        # Read chunk directly from HDF5 (only this chunk in memory)
-                        # CRITICAL: Use .copy() to break HDF5 dataset reference and create independent numpy arrays
-                        x_chunk = events_group["x"][chunk_start:chunk_end].copy()
-                        y_chunk = events_group["y"][chunk_start:chunk_end].copy()
-                        t_chunk = events_group["t"][chunk_start:chunk_end].copy()
-                        p_chunk = events_group["p"][chunk_start:chunk_end].copy()
+                        for chunk_idx in range(num_chunks):
+                            chunk_start = start_idx + chunk_idx * chunk_size
+                            chunk_end = min(start_idx + (chunk_idx + 1) * chunk_size, end_idx)
+                            
+                            # Read chunk directly from HDF5 (only this chunk in memory)
+                            # CRITICAL: Use .copy() to break HDF5 dataset reference
+                            x_chunk = events_group["x"][chunk_start:chunk_end].copy()
+                            y_chunk = events_group["y"][chunk_start:chunk_end].copy()
+                            t_chunk = events_group["t"][chunk_start:chunk_end].copy()
+                            p_chunk = events_group["p"][chunk_start:chunk_end].copy()
+                            
+                            # SpikingJelly expects polarity in 0/1 format
+                            # Normalize polarity: if already 0/1, keep it; if -1/1, convert to 0/1
+                            if np.any(p_chunk < 0):
+                                # Polarity is in -1/1 format, convert to 0/1 for SpikingJelly
+                                p_chunk_normalized = ((p_chunk + 1) / 2).astype(np.uint8)
+                            else:
+                                # Polarity is already in 0/1 format
+                                p_chunk_normalized = p_chunk.astype(np.uint8)
+                            
+                            # Convert to appropriate types for SpikingJelly
+                            x_chunk = x_chunk.astype(np.uint16)
+                            y_chunk = y_chunk.astype(np.uint16)
+                            t_chunk = t_chunk.astype(np.int64)
+                            
+                            # Integrate events into time bins using SpikingJelly
+                            for t_idx in range(T):
+                                # Find events in this time bin
+                                bin_start = time_bin_edges[t_idx]
+                                bin_end = time_bin_edges[t_idx + 1]
+                                
+                                # Filter events in this time bin
+                                time_mask = (t_chunk >= bin_start) & (t_chunk < bin_end)
+                                if not np.any(time_mask):
+                                    continue
+                                
+                                # Get events in this bin
+                                x_bin = x_chunk[time_mask]
+                                y_bin = y_chunk[time_mask]
+                                p_bin = p_chunk_normalized[time_mask]
+                                
+                                # Use SpikingJelly to integrate events to frame
+                                # integrate_events_segment_to_frame(x, y, p, H, W, j_l, j_r)
+                                # Returns [2, H, W] where [0] is ON events, [1] is OFF events
+                                frame_segment = sjds.integrate_events_segment_to_frame(
+                                    x_bin, y_bin, p_bin, H, W, 0, len(x_bin)
+                                )
+                                
+                                # frame_segment is [2, H, W] where [0] is ON events, [1] is OFF events
+                                # Convert to signed: ON events = +1, OFF events = -1
+                                signed_frame = frame_segment[0].astype(np.float32) - frame_segment[1].astype(np.float32)
+                                
+                                # Accumulate into frames
+                                frames[t_idx] += torch.from_numpy(signed_frame).to(device)
+                            
+                            # Delete chunk arrays immediately
+                            del x_chunk, y_chunk, t_chunk, p_chunk, p_chunk_normalized
+                            gc.collect()
+                    else:
+                        # Small number of events - read all at once
+                        x = events_group["x"][start_idx:end_idx].copy()
+                        y = events_group["y"][start_idx:end_idx].copy()
+                        t = events_group["t"][start_idx:end_idx].copy()
+                        p = events_group["p"][start_idx:end_idx].copy()
                         
-                        # Convert to tensors - use .clone() to ensure tensor owns its memory
-                        # This breaks the numpy array reference completely
-                        x_t = torch.from_numpy(x_chunk.astype(np.float32, copy=False)).clone().to(device)
-                        y_t = torch.from_numpy(y_chunk.astype(np.float32, copy=False)).clone().to(device)
-                        t_t = torch.from_numpy(t_chunk.astype(np.float32, copy=False)).clone().to(device)
-                        p_t = torch.from_numpy(p_chunk.astype(np.float32, copy=False)).clone().to(device)
-                        
-                        # Delete numpy arrays immediately (critical for memory)
-                        # Now safe to delete since tensors have their own memory via .clone()
-                        del x_chunk, y_chunk, t_chunk, p_chunk
-                        import gc
-                        gc.collect()  # Force GC after each chunk
-                        
-                        # Explicitly clear CUDA cache if CUDA is available (safety measure)
-                        # Even though we use CPU device, this ensures no accidental CUDA allocations persist
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                        
-                        # Bucketize timestamps
-                        if bin_edges is not None:
-                            b_chunk = torch.bucketize(t_t.contiguous(), bin_edges) - 1
-                            b_chunk = b_chunk.clamp_(0, T - 1)
+                        # Normalize polarity for SpikingJelly (0/1 format)
+                        if np.any(p < 0):
+                            p_normalized = ((p + 1) / 2).astype(np.uint8)
                         else:
-                            b_chunk = torch.full((len(t_t),), T - 1, device=device, dtype=torch.long)
+                            p_normalized = p.astype(np.uint8)
                         
-                        # Integer pixel coords
-                        xi_chunk = x_t.long().clamp_(0, W - 1)
-                        yi_chunk = y_t.long().clamp_(0, H - 1)
+                        # Convert to appropriate types
+                        x = x.astype(np.uint16)
+                        y = y.astype(np.uint16)
+                        t = t.astype(np.int64)
                         
-                        # Signed polarity
-                        if torch.any(p_t < 0):
-                            val_chunk = p_t.to(dtype)
-                        else:
-                            val_chunk = (2.0 * p_t.to(dtype) - 1.0)
+                        # Integrate events into time bins
+                        for t_idx in range(T):
+                            bin_start = time_bin_edges[t_idx]
+                            bin_end = time_bin_edges[t_idx + 1]
+                            
+                            time_mask = (t >= bin_start) & (t < bin_end)
+                            if not np.any(time_mask):
+                                continue
+                            
+                            x_bin = x[time_mask]
+                            y_bin = y[time_mask]
+                            p_bin = p_normalized[time_mask]
+                            
+                            frame_segment = sjds.integrate_events_segment_to_frame(
+                                x_bin, y_bin, p_bin, H, W, 0, len(x_bin)
+                            )
+                            
+                            # Convert to signed format
+                            signed_frame = frame_segment[0].astype(np.float32) - frame_segment[1].astype(np.float32)
+                            frames[t_idx] += torch.from_numpy(signed_frame).to(device)
                         
-                        # Accumulate into frames
-                        frames.index_put_((b_chunk, yi_chunk, xi_chunk), val_chunk, accumulate=True)
-                        
-                        # Delete chunk tensors immediately
-                        del x_t, y_t, t_t, p_t, b_chunk, xi_chunk, yi_chunk, val_chunk
-                        
-                        # Force garbage collection after each chunk to free memory immediately
-                        import gc
+                        del x, y, t, p, p_normalized
                         gc.collect()
-                        
-                        # Explicitly clear CUDA cache if CUDA is available (safety measure)
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
                 else:
-                    # Small number of events - read all at once but still process efficiently
-                    # CRITICAL: Use .copy() to break HDF5 dataset reference
-                    x = events_group["x"][start_idx:end_idx].copy()
-                    y = events_group["y"][start_idx:end_idx].copy()
-                    t = events_group["t"][start_idx:end_idx].copy()
-                    p = events_group["p"][start_idx:end_idx].copy()
-                    
-                    # Convert to tensors - use .clone() to ensure tensor owns its memory
-                    x_t = torch.from_numpy(x.astype(np.float32, copy=False)).clone().to(device)
-                    y_t = torch.from_numpy(y.astype(np.float32, copy=False)).clone().to(device)
-                    t_t = torch.from_numpy(t.astype(np.float32, copy=False)).clone().to(device)
-                    p_t = torch.from_numpy(p.astype(np.float32, copy=False)).clone().to(device)
-                    
-                    # Delete numpy arrays immediately (now safe since tensors have own memory)
-                    del x, y, t, p
-                    import gc
-                    gc.collect()
-                    
-                    # Bucketize
-                    if bin_edges is not None:
-                        b = torch.bucketize(t_t.contiguous(), bin_edges) - 1
-                        b = b.clamp_(0, T - 1)
-                    else:
-                        b = torch.full((len(t_t),), T - 1, device=device, dtype=torch.long)
-                    
-                    # Integer pixel coords
-                    xi = x_t.long().clamp_(0, W - 1)
-                    yi = y_t.long().clamp_(0, H - 1)
-                    
-                    # Signed polarity
-                    if torch.any(p_t < 0):
-                        val = p_t.to(dtype)
-                    else:
-                        val = (2.0 * p_t.to(dtype) - 1.0)
-                    
-                    # Accumulate
-                    frames.index_put_((b, yi, xi), val, accumulate=True)
-                    
-                    # Delete immediately
-                    del x_t, y_t, t_t, p_t, b, xi, yi, val
-                    import gc
-                    gc.collect()
-                    
-                    # Explicitly clear CUDA cache if CUDA is available (safety measure)
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                    # Fallback to manual method if SpikingJelly not available
+                    logger.warning("SpikingJelly not available. Using manual event-to-frame conversion.")
+                    raise ImportError("SpikingJelly is required for event-to-frame conversion. Please install it: pip install spikingjelly")
                 
                 # HDF5 file handle is automatically closed by 'with' statement
-                # But explicitly clear any remaining references after processing
                 del events_group
-                import gc
                 gc.collect()
-                
-                # Explicitly clear CUDA cache after processing all events
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
 
         except Exception as e:
             logger.error(f"Error streaming events from {h5_file}: {e}")
@@ -1437,8 +1459,6 @@ class UltraLowMemoryLoader(Dataset):
             return frames, event_timestamps
 
         # Create event_timestamps tensor with min/max for annotation matching
-        # We only need min/max, not all timestamps (saves huge memory for 3-4M events)
-        # Create a small tensor with [min, max] for _load_annotations_for_events
         if t_min_val is not None and t_max_val is not None:
             event_timestamps = torch.tensor([t_min_val, t_max_val], dtype=torch.float32, device=device)
         else:
@@ -1465,6 +1485,8 @@ class UltraLowMemoryLoader(Dataset):
         WARNING: This method loads all events into memory first. For large event counts (3-4M+),
         use _events_to_frames_streaming instead to avoid CUDA OOM errors.
         This method is kept for backward compatibility but should not be used in __getitem__.
+        
+        NOTE: Always uses CPU device for data loading, regardless of input tensor device.
         """
         # Determine output geometry
         if not hasattr(self, 'time_steps'):
@@ -1474,8 +1496,11 @@ class UltraLowMemoryLoader(Dataset):
         H = getattr(self, 'image_height', 720)
         W = getattr(self, 'image_width', 1280)
 
-        # Create empty frames on CPU by default; move to events.device if needed later
-        device = events.device
+        # CRITICAL: Always use CPU for data loading, regardless of input tensor device
+        # Move events to CPU if they're not already there
+        if events.device.type != 'cpu':
+            events = events.cpu()
+        device = 'cpu'  # Always CPU for data loading
         dtype = torch.float32
         frames = torch.zeros((T, H, W), dtype=dtype, device=device)
 
@@ -1551,12 +1576,7 @@ class UltraLowMemoryLoader(Dataset):
                 del x_chunk, y_chunk, t_chunk, p_chunk, b_chunk, xi_chunk, yi_chunk, val_chunk
                 
                 # Force garbage collection after each chunk
-                import gc
                 gc.collect()
-                
-                # Explicitly clear CUDA cache if CUDA is available
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
         else:
             # Small number of events - process all at once but still delete immediately
             x = events[:, 0].clone()
@@ -1586,12 +1606,7 @@ class UltraLowMemoryLoader(Dataset):
             
             # Delete immediately
             del x, y, t, p, b, xi, yi, val
-            import gc
             gc.collect()
-            
-            # Explicitly clear CUDA cache if CUDA is available
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
 
         # SCALE AND CLIP FOR SNN STABILITY:
         # Large raw counts can saturate MultiSpike4 / Integer LIF neurons.
@@ -1607,12 +1622,7 @@ class UltraLowMemoryLoader(Dataset):
         frames = frames.clamp_(-float(clip), float(clip))
         
         # Final cleanup - ensure all event data is freed
-        import gc
         gc.collect()
-        
-        # Explicitly clear CUDA cache if CUDA is available
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
 
         return frames
 
@@ -1707,17 +1717,21 @@ class UltraLowMemoryLoader(Dataset):
         
         # Load corresponding annotations with temporal matching (uses event_timestamps)
         targets = self._load_annotations_for_events(h5_file, event_timestamps)
+        # Dataset & cache are always CPU-only
+        frames = frames.cpu()
+        targets = targets.cpu()
+        if isinstance(event_timestamps, torch.Tensor):
+            event_timestamps = event_timestamps.cpu()
         
         # Force garbage collection to free any remaining memory
-        import gc
         gc.collect()
         
-        # Explicitly clear CUDA cache after loading sample to prevent memory accumulation
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        
-        if self.force_cpu:
-            frames = frames.cpu()
+        # CRITICAL: Ensure all tensors are on CPU (data loading is always CPU-only)
+        # This is independent of force_cpu config which is for the entire pipeline
+        frames = frames.cpu()
+        targets = targets.cpu()
+        if isinstance(event_timestamps, torch.Tensor):
+            event_timestamps = event_timestamps.cpu()
 
         # Cache if needed (frames only - events removed to save memory)
         if self.cache_samples and self._sample_cache is not None:
@@ -1814,6 +1828,10 @@ def custom_collate_fn(batch, force_cpu=False):
     
     NOTE: Raw events are no longer included in the batch to save memory.
     Only frames [T,H,W] are returned, which is what the model uses.
+    
+    CRITICAL: Data loading is always CPU-only, regardless of force_cpu config.
+    The force_cpu parameter is only used for compatibility and is separate from
+    the force_cpu config which controls the entire pipeline.
     """
     targets = [item["targets"] for item in batch]
     event_timestamps = [item["event_timestamps"] for item in batch]
@@ -1821,16 +1839,15 @@ def custom_collate_fn(batch, force_cpu=False):
     sample_indices = [item["sample_idx"] for item in batch]
     frames_list = [item.get("frames") for item in batch]
 
-    # CRITICAL: Force all input tensors to CPU ONLY if force_cpu is True
-    # Worker processes might create tensors on CUDA even with pin_memory=False
-    if force_cpu:
-        targets = [t.cpu() if t.is_cuda else t for t in targets]
-        event_timestamps = [ts.cpu() if ts.is_cuda else ts for ts in event_timestamps]
+    # CRITICAL: Data loading is always CPU-only to prevent GPU memory usage
+    # Ensure all tensors are on CPU (they should already be, but enforce it)
+    targets = [t.cpu() if t.device.type != 'cpu' else t for t in targets]
+    event_timestamps = [ts.cpu() if ts.device.type != 'cpu' else ts for ts in event_timestamps]
 
     # Handle targets with different sizes (some samples may have 0 annotations)
+    # CRITICAL: Always use CPU device for data loading
     if len(targets) == 0:
-        device = 'cpu' if force_cpu else None
-        targets_tensor = torch.zeros((0, 8), dtype=torch.float32, device=device)  # Updated to 8 to include timestamp
+        targets_tensor = torch.zeros((0, 8), dtype=torch.float32, device='cpu')  # Updated to 8 to include timestamp
     else:
         # Find the maximum number of annotations in any sample
         max_annotations = max(target.shape[0] for target in targets)
@@ -1838,25 +1855,21 @@ def custom_collate_fn(batch, force_cpu=False):
         # Pad all targets to the same size
         padded_targets = []
         for target in targets:
-            # Ensure target is on CPU if force_cpu
-            if force_cpu:
-                target = target.cpu()
+            # Ensure target is on CPU (data loading is always CPU-only)
+            target = target.cpu() if target.device.type != 'cpu' else target
             if target.shape[0] < max_annotations:
-                # Pad with zeros - explicitly use CPU device if force_cpu
-                device = 'cpu' if force_cpu else target.device
-                padding = torch.zeros((max_annotations - target.shape[0], target.shape[1]), dtype=target.dtype, device=device)
+                # Pad with zeros - always use CPU device
+                padding = torch.zeros((max_annotations - target.shape[0], target.shape[1]), dtype=target.dtype, device='cpu')
                 padded_target = torch.cat([target, padding], dim=0)
-                if force_cpu:
-                    padded_target = padded_target.cpu()
             else:
-                padded_target = target.cpu() if force_cpu else target
+                padded_target = target
             padded_targets.append(padded_target)
 
         targets_tensor = torch.stack(padded_targets, dim=0)
-        if force_cpu:
-            targets_tensor = targets_tensor.cpu()
+        # Ensure final tensor is on CPU
+        targets_tensor = targets_tensor.cpu()
 
-    # Stack frames: each is [T,H,W]; ensure CPU if force_cpu
+    # Stack frames: each is [T,H,W]; always ensure CPU (data loading is CPU-only)
     if len(frames_list) == 0 or frames_list[0] is None:
         frames_tensor = None
     else:
@@ -1866,9 +1879,12 @@ def custom_collate_fn(batch, force_cpu=False):
             if f is None:
                 frames_tensor = None
                 break
-            frames_list_proc.append(f.cpu() if force_cpu else f)
+            # Ensure frame is on CPU (data loading is always CPU-only)
+            frames_list_proc.append(f.cpu() if f.device.type != 'cpu' else f)
         else:
             frames_tensor = torch.stack(frames_list_proc, dim=0)  # [B,T,H,W]
+            # Ensure final tensor is on CPU
+            frames_tensor = frames_tensor.cpu()
 
     # Pad event timestamps to same length for the batch
     # Get max length from event_timestamps (they correspond to the original events)
@@ -1879,23 +1895,19 @@ def custom_collate_fn(batch, force_cpu=False):
     
     padded_timestamps = []
     for ts in event_timestamps:
-        # Ensure ts is on CPU if force_cpu
-        if force_cpu:
-            ts = ts.cpu()
+        # Ensure ts is on CPU (data loading is always CPU-only)
+        ts = ts.cpu() if ts.device.type != 'cpu' else ts
         if ts.shape[0] < max_length:
-            # Pad with -1 (invalid timestamp marker) - explicitly use CPU device if force_cpu
-            device = 'cpu' if force_cpu else ts.device
-            padding = torch.zeros(max_length - ts.shape[0], dtype=ts.dtype, device=device) - 1
+            # Pad with -1 (invalid timestamp marker) - always use CPU device
+            padding = torch.zeros(max_length - ts.shape[0], dtype=ts.dtype, device='cpu') - 1
             padded_ts = torch.cat([ts, padding], dim=0)
-            if force_cpu:
-                padded_ts = padded_ts.cpu()
         else:
-            padded_ts = ts.cpu() if force_cpu else ts
+            padded_ts = ts
         padded_timestamps.append(padded_ts)
 
     event_timestamps_tensor = torch.stack(padded_timestamps, dim=0)
-    if force_cpu:
-        event_timestamps_tensor = event_timestamps_tensor.cpu()
+    # Ensure final tensor is on CPU
+    event_timestamps_tensor = event_timestamps_tensor.cpu()
 
     return {
         "frames": frames_tensor,                 # [B, T, H, W] - model input
@@ -1919,6 +1931,7 @@ def create_ultra_low_memory_dataloader(data_root: str, split: str = "train",
                                       debug_sample_loading: bool = False,
                                       time_steps: Optional[int] = None,
                                       image_height: int = 720, image_width: int = 1280, time_window_us: int = 100000,
+                                      max_total_samples: int = None,
                                       config: Optional[Any] = None):
     logger.info("=== CREATING ULTRA LOW MEMORY DATALOADER ===")
     logger.info(f"Data root: {data_root}")
@@ -1927,6 +1940,7 @@ def create_ultra_low_memory_dataloader(data_root: str, split: str = "train",
     logger.info(f"Max events per sample: {max_events_per_sample}")
     logger.info(f"Max samples per file: {max_samples_per_file}")
     logger.info(f"Max annotations per class: {max_annotations_per_class}")
+    logger.info(f"Max total samples: {max_total_samples}")
     logger.info(f"Targeted training: {targeted_training}")
     logger.info(f"Num workers: {num_workers}")
     logger.info(f"Annotation dir: {annotation_dir}")
@@ -1958,7 +1972,8 @@ def create_ultra_low_memory_dataloader(data_root: str, split: str = "train",
         time_steps=time_steps,
         image_height=image_height,
         image_width=image_width,
-        time_window_us=time_window_us
+        time_window_us=time_window_us,
+        max_total_samples=max_total_samples
     )
 
     logger.info(f"Dataset created with {len(dataset)} samples")

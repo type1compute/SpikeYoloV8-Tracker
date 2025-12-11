@@ -9,6 +9,7 @@ import torch.nn.functional as F
 import numpy as np
 from typing import List, Tuple, Dict, Any
 import math
+import logging
 from ultralytics.utils.tal import TaskAlignedAssigner
 
 try:
@@ -17,6 +18,7 @@ except ImportError:
     linear_sum_assignment = None
 
 SUPCON_TEMPERATURE = 0.07
+logger = logging.getLogger(__name__)
 
 class YOLOLoss(nn.Module):
     """
@@ -179,7 +181,7 @@ class YOLOLoss(nn.Module):
             # Temporal-aware predictions: [T, B, H*W, features]
             T, B, num_anchors, num_features = predictions.shape
             # Reshape to [T*B, H*W, features] to process each temporal step separately
-            predictions = predictions.view(T * B, num_anchors, num_features)
+            predictions = predictions.reshape(T * B, num_anchors, num_features)
             batch_size = B  # Original batch size
             temporal_batch_size = T * B  # Expanded batch size
         elif predictions.dim() == 3:
@@ -195,6 +197,7 @@ class YOLOLoss(nn.Module):
                 # Filter targets by temporal bin for each temporal step
                 # This ensures predictions from temporal step t only match annotations in temporal bin t
                 expanded_targets = []
+                expanded_event_timestamps = [] if event_timestamps is not None else None
 
                 # Calculate temporal bin boundaries from event timestamps if available
                 # Otherwise, use a simple approach (divide time window equally)
@@ -260,25 +263,39 @@ class YOLOLoss(nn.Module):
                                             filtered_targets = torch.zeros((0, 8), device=batch_targets.device, dtype=batch_targets.dtype)
 
                                         expanded_targets.append(filtered_targets)
+                                        if expanded_event_timestamps is not None:
+                                            bin_events_mask = (valid_timestamps >= bin_start) & (valid_timestamps <= bin_end)
+                                            bin_events = valid_timestamps[bin_events_mask]
+                                            expanded_event_timestamps.append(bin_events.clone())
                                     else:
                                         # No annotations for this batch item
                                         expanded_targets.append(torch.zeros((0, 8), device=valid_timestamps.device, dtype=torch.float32))
+                                        if expanded_event_timestamps is not None:
+                                            expanded_event_timestamps.append(torch.zeros((0,), device=valid_timestamps.device, dtype=valid_timestamps.dtype))
                             else:
                                 # No valid timestamps, fallback to repeating all annotations
                                 for t in range(T):
                                     expanded_targets.append(targets[batch_idx])
+                                    if expanded_event_timestamps is not None:
+                                        expanded_event_timestamps.append(valid_timestamps.clone())
                         else:
                             # No event timestamps for this batch item, fallback to repeating all annotations
                             for t in range(T):
                                 expanded_targets.append(targets[batch_idx])
+                                if expanded_event_timestamps is not None:
+                                    expanded_event_timestamps.append(torch.zeros((0,), dtype=torch.float32))
                 else:
                     # No event timestamps available, fallback to repeating all annotations
                     # (This maintains backward compatibility)
                     for batch_idx in range(B):
                         for t in range(T):
                             expanded_targets.append(targets[batch_idx])
+                            if expanded_event_timestamps is not None:
+                                expanded_event_timestamps.append(None)
 
                 targets = expanded_targets
+                if expanded_event_timestamps is not None and len(expanded_event_timestamps) == len(expanded_targets):
+                    event_timestamps = expanded_event_timestamps
         loss_dict = {
             'box_loss': 0.0,
             'dfl_loss': 0.0,
@@ -290,8 +307,8 @@ class YOLOLoss(nn.Module):
         # Collect matched anchor information for tracking loss (using track_id from annotations)
         matched_anchor_info = []  # List of (batch_idx, anchor_idx, track_id) tuples
 
-        # Track how many batches had valid targets for proper averaging
-        num_valid_batches = 0
+        # Track how many temporal slices were processed (including background-only bins)
+        num_batches_processed = 0
 
         # Process each batch item (including temporal steps)
         for batch_idx in range(temporal_batch_size):
@@ -300,21 +317,28 @@ class YOLOLoss(nn.Module):
             # Map temporal batch index to original batch index
             original_batch_idx = batch_idx % B if T > 1 else batch_idx
 
-            target = targets[batch_idx] if batch_idx < len(targets) else torch.zeros((0, 8), device=self.device)
+            if batch_idx < len(targets):
+                target = targets[batch_idx]
+            else:
+                target = torch.zeros((0, 8), device=pred.device, dtype=torch.float32)
 
             # Extract event timestamps for this batch item if available
             batch_event_timestamps = None
             if event_timestamps is not None:
-                # Use original batch index for event timestamps
-                if original_batch_idx < len(event_timestamps):
-                    batch_event_timestamps = event_timestamps[original_batch_idx]  # [num_events]
+                if isinstance(event_timestamps, (list, tuple)):
+                    idx = batch_idx if len(event_timestamps) == temporal_batch_size else original_batch_idx
+                    if idx < len(event_timestamps):
+                        batch_event_timestamps = event_timestamps[idx]
+                else:
+                    if isinstance(event_timestamps, torch.Tensor):
+                        if event_timestamps.dim() == 1:
+                            batch_event_timestamps = event_timestamps
+                        elif event_timestamps.dim() >= 2 and original_batch_idx < event_timestamps.shape[0]:
+                            batch_event_timestamps = event_timestamps[original_batch_idx]
+                    else:
+                        batch_event_timestamps = event_timestamps
 
-            if len(target) == 0:
-                # No targets - skip this batch (background samples are handled via classification loss)
-                continue
-
-            # Count this as a valid batch with targets
-            num_valid_batches += 1
+            num_batches_processed += 1
 
             # Compute losses for this batch item with temporal information
             batch_losses = self._compute_batch_loss(pred, target, batch_event_timestamps, current_epoch)
@@ -324,19 +348,15 @@ class YOLOLoss(nn.Module):
                 loss_dict[key] += value
 
             # Collect matched anchor information for tracking loss
-            if track_features is not None and len(target) > 0:
+            if track_features is not None and target.numel() > 0:
                 matched_info = self._extract_matched_anchor_info(pred, target, batch_event_timestamps)
                 for anchor_idx, track_id in matched_info:
                     matched_anchor_info.append((batch_idx, anchor_idx, track_id))
 
-        # Average over only the batches that had valid targets (not all temporal_batch_size)
-        # This prevents diluting the loss signal from sparse annotations
-        if num_valid_batches > 0:
+        # Average across all processed temporal slices (positives + background-only bins)
+        if num_batches_processed > 0:
             for key in ('box_loss', 'dfl_loss', 'cls_loss', 'track_loss'):
-                loss_dict[key] /= num_valid_batches
-        else:
-            # No valid batches - all losses remain zero
-            pass
+                loss_dict[key] /= num_batches_processed
 
         # Compute feature-based tracking loss if provided
         if track_features is not None:
@@ -511,8 +531,19 @@ class YOLOLoss(nn.Module):
 
         # Move target to the same device as pred
         target = target.to(device)
-        if event_timestamps is not None and isinstance(event_timestamps, torch.Tensor):
-            event_timestamps = event_timestamps.to(device)
+
+        def _prepare_event_tensor(evt):
+            if evt is None:
+                return None
+            if torch.is_tensor(evt):
+                return evt.to(device)
+            try:
+                tensor_evt = torch.as_tensor(evt, dtype=torch.float32, device=device)
+                return tensor_evt
+            except Exception:
+                return None
+
+        event_timestamps = _prepare_event_tensor(event_timestamps)
 
         num_anchors = pred.shape[0]
         num_targets = len(target) if isinstance(target, torch.Tensor) else target.shape[0]
@@ -534,14 +565,14 @@ class YOLOLoss(nn.Module):
             # RAW per-side DFL logits and class logits
             pred_dist = pred[:, :4 * reg_max]
             pred_cls  = pred[:, 4 * reg_max : 4 * reg_max + self.num_classes]
-            pred_dfl_logits = pred_dist.view(-1, 4, reg_max)  # [A,4,M]
+            pred_dfl_logits = pred_dist.reshape(-1, 4, reg_max)  # [A,4,M]
 
             # Decode distances via integral projection to get xywh (normalized)
             A = pred.shape[0]
             H, W = self._infer_hw_from_num_cells(A)
             anc_points = self._make_grid_points(H, W, pred.device, pred.dtype)  # [A,2] in 0..1
 
-            per_side_expect = self._project_dfl(pred_dfl_logits.view(-1, reg_max)).view(-1, 4)  # [A,4] bins
+            per_side_expect = self._project_dfl(pred_dfl_logits.reshape(-1, reg_max)).reshape(-1, 4)  # [A,4] bins
             l, t, r, b = (per_side_expect / float(reg_max)).unbind(dim=1)  # 0..1 distances
             cx, cy = anc_points[:, 0], anc_points[:, 1]
             x1 = (cx - l).clamp(0, 1); y1 = (cy - t).clamp(0, 1)
@@ -588,8 +619,11 @@ class YOLOLoss(nn.Module):
         target_boxes_normalized = torch.clamp(target_boxes_normalized, 0.0, 1.0)
         # Initialize losses with proper device and dtype
         box_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
-        cls_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
         dfl_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
+
+        if pred_cls is None:
+            raise ValueError("Prediction tensor missing class logits")
+        cls_targets_all = torch.zeros(num_anchors, self.num_classes, device=pred_cls.device, dtype=pred_cls.dtype)
 
         if num_targets > 0:
             # DEBUG: Check for NaN/Inf in inputs before IoU
@@ -635,7 +669,7 @@ class YOLOLoss(nn.Module):
                 }
 
             # Temporal-aware matching if event_timestamps available
-            if event_timestamps is not None and len(event_timestamps) > 0:
+            if event_timestamps is not None and event_timestamps.numel() > 0:
                 best_ious, best_indices = self._temporal_aware_matching(
                     pred_boxes_normalized,
                     target,
@@ -703,12 +737,6 @@ class YOLOLoss(nn.Module):
             # CRITICAL: Apply classification loss to ALL anchors (matched + unmatched)
             # This is how the model learns background (negative samples)
 
-            # Initialize classification targets for ALL anchors as background (all zeros)
-            # Shape: [num_anchors, num_classes] filled with zeros (background)
-            # Use the device from pred/target (which should be CUDA if available)
-            device = pred_boxes_normalized.device if pred_boxes_normalized.is_cuda else (torch.device(self.device) if isinstance(self.device, str) else self.device)
-            cls_targets_all = torch.zeros(num_anchors, self.num_classes, device=device)
-
             # For MATCHED anchors, compute box and class losses
             if matched_mask.any():
                 matched_indices = matched_mask.nonzero(as_tuple=True)[0]
@@ -756,12 +784,9 @@ class YOLOLoss(nn.Module):
                 # print(f"DEBUG: No matches found - all {num_anchors} anchors are background (threshold={self.iou_threshold}, max_iou={max_iou:.3f}, min_iou={min_iou:.3f}, mean_iou={mean_iou:.3f})")
                 # cls_targets_all is already all zeros (background)
                 pass
-
-            # CRITICAL: Compute classification loss for ALL anchors (matched + unmatched)
-            # Matched anchors: learn to predict the correct class (one-hot)
-            # Unmatched anchors: learn to predict background (all zeros)
-            # Focal loss will automatically down-weight easy examples (backgrounds)
-            cls_loss = self._compute_classification_loss_from_one_hot(pred_cls, cls_targets_all)
+        # CRITICAL: Compute classification loss for ALL anchors (matched + unmatched)
+        # Background-only bins (num_targets == 0) still contribute via zero targets
+        cls_loss = self._compute_classification_loss_from_one_hot(pred_cls, cls_targets_all)
 
         return {
             'box_loss': box_loss,
@@ -1168,8 +1193,14 @@ class YOLOLoss(nn.Module):
 
         # Move target to the same device as pred
         target = target.to(device)
-        if event_timestamps is not None and isinstance(event_timestamps, torch.Tensor):
-            event_timestamps = event_timestamps.to(device)
+        if event_timestamps is not None:
+            if torch.is_tensor(event_timestamps):
+                event_timestamps = event_timestamps.to(device)
+            else:
+                try:
+                    event_timestamps = torch.as_tensor(event_timestamps, dtype=torch.float32, device=device)
+                except Exception:
+                    event_timestamps = None
 
         # Extract target boxes and track_ids
         target_boxes = target[:, 1:5]  # [x, y, w, h] - in pixel coordinates
@@ -1191,7 +1222,7 @@ class YOLOLoss(nn.Module):
         C = self.num_classes
         pred_cls_logits = pred[:, -C:]  # [A,C]
 
-        if event_timestamps is not None and len(event_timestamps) > 0:
+        if event_timestamps is not None and event_timestamps.numel() > 0:
             best_ious, best_indices = self._temporal_aware_matching(
                 pred_boxes_normalized,
                 target,
@@ -1460,7 +1491,15 @@ class YOLOLoss(nn.Module):
         # --- Pre-filter GTs by time window ---
         dt = (gt_ts_n - t_bin_n).abs()
         keep_mask = dt <= time_window_frac
-        assert keep_mask.any(), "No GTs within temporal window; consider widening time_window_frac"
+        if not keep_mask.any():
+            logger.debug(
+                "Temporal matching: no GT within ±%.2f of bin (norm t=%.4f). "
+                "Treating timestep as background.",
+                time_window_frac, float(t_bin_n)
+            )
+            best_ious = torch.zeros(A, device=device, dtype=dtype)
+            best_indices = torch.full((A,), -1, device=device, dtype=torch.long)
+            return best_ious, best_indices
 
         tgt_keep_idx = keep_mask.nonzero(as_tuple=True)[0]  # [Gk]
         tgt_keep = target[tgt_keep_idx]

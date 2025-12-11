@@ -67,7 +67,7 @@ architecture:
   time_window_us: 100000  # 100ms
 
   # Number of time steps for temporal processing
-  time_steps: 8
+  time_steps: 4
   
   # Tracking feature dimension
   track_feature_dim: 128
@@ -90,6 +90,10 @@ training:
   # DISABLED: SpikeYOLO operations are incompatible with FP16 (causes NaN even after FP32 training)
   # Focus on other optimizations: batch size, data loading, gradient accumulation
   use_amp: false
+  
+  # Gradient checkpointing trades ~10-15% compute for ~35-40% lower activation memory.
+  # Enable when running into GPU memory exhaustion (recommended for 720×1280 inputs).
+  use_gradient_checkpointing: true
   
   # Quantization-Aware Training (QAT) - DISABLED (slows training, only helps inference)
   use_quantization: false  # Disabled: QAT slows training by 5-15%
@@ -244,8 +248,8 @@ data_processing:
   num_workers: 12  # Increased for better HDF5 I/O parallelization and GPU utilization
   
   # Sample caching to speed up repeated accesses (stores preprocessed samples in memory)
-  cache_samples: false  # DISABLED: Caching on GPU causes OOM with large datasets
-  preload_all_samples: false  # PRE-LOAD ALL SAMPLES INTO RAM during init (DISABLED: causes CUDA OOM)
+  cache_samples: true  # Caching on System memory
+  preload_all_samples: true  # PRE-LOAD ALL SAMPLES INTO RAM during init
   debug_sample_loading: false  # Set true to log per-sample streaming info (adds overhead)
   
   # Class balancing configuration (when use_class_balanced_sampling=true)

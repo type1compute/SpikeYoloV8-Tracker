@@ -26,6 +26,7 @@ import torch.nn.functional as F
 import numpy as np
 from typing import Dict, Tuple, Union, List
 import logging
+from torch.utils.checkpoint import checkpoint
 from ultralytics.trackers.byte_tracker import BYTETracker
 from ultralytics.utils.tal import dist2bbox, make_anchors
 
@@ -759,6 +760,7 @@ class eTraMSpikeYOLOWithTracking(nn.Module):
         self.class_names = class_names
         # Flag to track if weights have been initialized
         self._weights_initialized = False
+        self.gradient_checkpointing = False
 
 
         # OPTIMIZATION: Remove MS_GetT - go directly to backbone
@@ -891,6 +893,28 @@ class eTraMSpikeYOLOWithTracking(nn.Module):
         self._weights_initialized = True
         logger.info("Weight initialization complete")
 
+    def enable_gradient_checkpointing(self):
+        """Enable gradient checkpointing to trade compute for lower activation memory."""
+        if not self.gradient_checkpointing:
+            logger.info("Gradient checkpointing enabled on eTraM SpikeYOLO backbone/heads")
+        self.gradient_checkpointing = True
+
+    def disable_gradient_checkpointing(self):
+        """Disable gradient checkpointing."""
+        if self.gradient_checkpointing:
+            logger.info("Gradient checkpointing disabled on eTraM SpikeYOLO")
+        self.gradient_checkpointing = False
+
+    def _run_with_gradient_checkpoint(self, module: nn.Module, tensor: torch.Tensor) -> torch.Tensor:
+        """Run module forward with optional gradient checkpointing."""
+        if not (self.gradient_checkpointing and self.training):
+            return module(tensor)
+
+        def custom_forward(inp):
+            return module(inp)
+
+        return checkpoint(custom_forward, tensor, use_reentrant=False)
+
     def _track_per_timestep(self, det_list: List[torch.Tensor]) -> Union[List[torch.Tensor], List[List[torch.Tensor]]]:
         """
         Run ByteTrack per timestep using decoded, per-scale detections.
@@ -1021,41 +1045,46 @@ class eTraMSpikeYOLOWithTracking(nn.Module):
 
         x = self.input_layer(x)        # Direct pass-through (no temporal manipulation)
 
+        if self.gradient_checkpointing and self.training:
+            # Make x a leaf tensor so checkpoint has a grad-capable input
+            x = x.detach()
+            x.requires_grad_(True)
+
         # FPN-style backbone processing: capture intermediate features
-        x = self.backbone_stage0(x)  # [T, B,  2, 720, 1280] -> [T, B,  64, 360, 640]
-        x = self.backbone_stage1(x)  # [T, B, 64, 360, 640]  -> [T, B, 128, 180, 320]
-        x = self.backbone_stage2(x)  # [T, B,128, 180, 320]  -> [T, B, 256,  90, 160] (P3 level)
+        x = self._run_with_gradient_checkpoint(self.backbone_stage0, x)  # [T, B,  2, 720, 1280] -> [T, B,  64, 360, 640]
+        x = self._run_with_gradient_checkpoint(self.backbone_stage1, x)  # [T, B, 64, 360, 640]  -> [T, B, 128, 180, 320]
+        x = self._run_with_gradient_checkpoint(self.backbone_stage2, x)  # [T, B,128, 180, 320]  -> [T, B, 256,  90, 160]
         p3_backbone = x  # Save P3 backbone features:   [T, B, 256,  90, 160]
 
-        x = self.backbone_stage3(x)  # [T, B,256,  90, 160]  -> [T, B, 512,  45,  80] (P4 level)
+        x = self._run_with_gradient_checkpoint(self.backbone_stage3, x)  # -> [T, B, 512, 45, 80]
         p4_backbone = x  # Save P4 backbone features:   [T, B, 512,  45,  80]
 
-        x = self.backbone_stage4(x)  # [T, B,512,  45,  80]  -> [T, B,1024,  23,  40] (P5 level)
+        x = self._run_with_gradient_checkpoint(self.backbone_stage4, x)  # -> [T, B,1024,  23,  40]
         p5_backbone = x  # Save P5 backbone features:   [T, B,1024,  23,  40]
 
         # FPN-style detection head processing with upsampling
         # P5: Start from backbone output (23×40)
-        p5_features = self.detection_head_p5(p5_backbone)  # [T, B,1024, 23, 40] -> [T, B, 512, 23, 40]
+        p5_features = self._run_with_gradient_checkpoint(self.detection_head_p5, p5_backbone)
 
         # P4: Lateral, upsample P5, fuse with P4 backbone (45×80)
-        p5_lateral = self.p4_lateral(p5_features)  # [T, B, 512, 23, 40] -> [T, B, 256, 23, 40]
+        p5_lateral = self._run_with_gradient_checkpoint(self.p4_lateral, p5_features)
         _, _, _, p4_h, p4_w = p4_backbone.shape  # target: (45, 80)
         p5_up = torch.nn.functional.interpolate(
             p5_lateral.flatten(0, 1), size=(p4_h, p4_w), mode='nearest'
         ).view(p5_lateral.shape[0], p5_lateral.shape[1], p5_lateral.shape[2], p4_h, p4_w)  # [T, B, 256, 45, 80]
         p4_fused = torch.cat([p5_up, p4_backbone], dim=2)  # [T, B, 256+512, 45, 80] = [T, B, 768, 45, 80]
-        p4_fused = self.p4_fusion(p4_fused)  # [T, B, 768, 45, 80] -> [T, B, 256, 45, 80]
-        p4_features = self.detection_head_p4(p4_fused)  # [T, B, 256, 45, 80] -> [T, B, 256, 45, 80]
+        p4_fused = self._run_with_gradient_checkpoint(self.p4_fusion, p4_fused)
+        p4_features = self._run_with_gradient_checkpoint(self.detection_head_p4, p4_fused)
 
         # P3: Lateral, upsample P4, fuse with P3 backbone (90×160)
-        p4_lateral = self.p3_lateral(p4_features)  # [T, B, 256, 45, 80] -> [T, B, 128, 45, 80]
+        p4_lateral = self._run_with_gradient_checkpoint(self.p3_lateral, p4_features)
         _, _, _, p3_h, p3_w = p3_backbone.shape  # target: (90, 160)
         p4_up = torch.nn.functional.interpolate(
             p4_lateral.flatten(0, 1), size=(p3_h, p3_w), mode='nearest'
         ).view(p4_lateral.shape[0], p4_lateral.shape[1], p4_lateral.shape[2], p3_h, p3_w)  # [T, B, 128, 90, 160]
         p3_fused = torch.cat([p4_up, p3_backbone], dim=2)  # [T, B, 128+256, 90, 160] = [T, B, 384, 90, 160]
-        p3_fused = self.p3_fusion(p3_fused)  # [T, B, 384, 90, 160] -> [T, B, 128, 90, 160]
-        p3_features = self.detection_head_p3(p3_fused)  # [T, B, 128, 90, 160] -> [T, B, 128, 90, 160]
+        p3_fused = self._run_with_gradient_checkpoint(self.p3_fusion, p3_fused)
+        p3_features = self._run_with_gradient_checkpoint(self.detection_head_p3, p3_fused)
 
         # Detection heads (order P5→P4→P3). In train mode: returns list of [T,B,4*reg_max + C,H,W].
         # In eval mode (binary head): returns (det_list per scale [T,B,A,4+C], track_feats per scale [B,D,H,W]).
