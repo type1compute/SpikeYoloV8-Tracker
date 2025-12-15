@@ -1,6 +1,6 @@
 # Event-based Object Detection & Tracking with Spiking Neural Networks
 
-A complete end-to-end pipeline for real-time object detection & tracking using event camera data (Architecture adapted from BICLab SpikeYOLO ECCV 2024 implementation).
+A complete end-to-end pipeline for real-time object detection & tracking using event camera data.
 
 ##   **Key Features**
 
@@ -46,7 +46,7 @@ Object_Detection&Tracking/
 
 ## 🧬 **Architecture**
 
-### **BICLab SpikeYOLO (ECCV 2024)**
+### **SpikeYolo V8**
 - **Neuron Type**: I-LIF (Integer-valued LIF) spiking neurons
 - **Training**: Integer-valued training + spike-driven inference
 - **Architecture**: Simplified YOLOv8 with meta SNN blocks
