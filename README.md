@@ -759,12 +759,11 @@ spike_frames = event_processor.events_to_spikes(events)
 
 ### **BICLab SpikeYOLO (ECCV 2024)**
 - **Paper**: "Integer-Valued Training and Spike-Driven Inference Spiking Neural Network for High-performance and Energy-efficient Object Detection"
-- **Authors**: Xinhao Luo, Man Yao, Yuhong Chou, Bo Xu, Guoqi Li
-- **Institution**: BICLab, Institute of Automation, Chinese Academy of Sciences
 - **Repository**: [BICLab SpikeYOLO](https://github.com/BICLab/SpikeYOLO)
 
 ### **eTraM Dataset**
-- **Paper**: Event-based Traffic Monitoring Dataset
+- **Paper**: eTraM: Event-based Traffic Monitoring Dataset
 - **Resolution**: 1280×720 pixels
 - **Classes**: 8 traffic participant classes
 - **Format**: HDF5 event files with NumPy annotations
+- **Repository**: [eTRAM](https://github.com/eventbasedvision/eTraM)
